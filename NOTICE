@@ -1,0 +1,14 @@
+Nook
+Copyright 2026 Ben
+GNU General Public License, version 3. See LICENSE.
+
+The native icon movement and drag-event delivery in
+Sources/MenuBarCore/Movement.swift and Sources/MenuBarCore/DragDelivery.swift
+are adapted from Ice by Jordan Baird and contributors.
+Copyright 2025 Jordan Baird.
+Upstream source: https://github.com/jordanbaird/Ice
+Upstream revision: ceccc08c5fc446482395b7b7c7ea86572730b2b6
+Nook adaptations dated 2026-10-04.
+
+Nook is provided without any warranty, including implied warranties of
+merchantability or fitness for a particular purpose. See LICENSE for terms.
