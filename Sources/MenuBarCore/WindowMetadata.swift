@@ -53,13 +53,20 @@ public struct WindowMetadata: Sendable {
 
     public static func settledStatusWindows(_ configuration:Configuration) async throws -> [WindowMetadata] {
         var previous = Dictionary(uniqueKeysWithValues:try statusWindows(configuration).map { ($0.id,$0.bounds) })
+        let tracing = CommandLine.arguments.contains("--trace-movement")
         var since = Date()
         let deadline = since.addingTimeInterval(configuration.movementTimeout)
         repeat {
             try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
             let current = try statusWindows(configuration)
             let bounds = Dictionary(uniqueKeysWithValues:current.map { ($0.id,$0.bounds) })
-            if bounds != previous { since = Date(); previous = bounds }
+            if bounds != previous {
+                if tracing {
+                    let changed = Set(bounds.keys).union(previous.keys).filter { bounds[$0] != previous[$0] }.sorted()
+                    fputs("Layout \(ProcessInfo.processInfo.systemUptime): \(changed.map { "\($0): \(String(describing:bounds[$0]))" }.joined(separator:"; "))\n",stderr)
+                }
+                since = Date(); previous = bounds
+            }
             if Date().timeIntervalSince(since) >= configuration.layoutSettlementPeriod { return current }
         } while Date() < deadline
         throw ManagerError("The native menu-bar layout did not settle")

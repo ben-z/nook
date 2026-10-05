@@ -40,6 +40,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     var fixturePID:pid_t?
     var revealWindow:CGWindowID?
     var expectedOrder:[CGWindowID]?
+    var inputMonitor:AuditInputMonitor?
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         Task { @MainActor in
@@ -53,8 +54,16 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                     guard let every = Int(try argument("--sample-every")),every > 0 else { throw ManagerError("Invalid sampling interval") }
                     audit.sampleEvery = every
                 }
+                if ["--e2e","--sound-e2e","--stress","--space-e2e","--order-e2e","--lifecycle-e2e","--restore-order","--restore","--select"].contains(where:CommandLine.arguments.contains) {
+                    inputMonitor = try AuditInputMonitor()
+                }
+                defer { inputMonitor?.close() }
                 if CommandLine.arguments.contains("--api") { try await api(try argument("--api")) }
                 else if CommandLine.arguments.contains("--e2e") { try await endToEnd() }
+                else if CommandLine.arguments.contains("--sound-e2e") {
+                    try await connectManager()
+                    for _ in 0..<audit.cycles { try await soundEndToEnd() }
+                }
                 else if CommandLine.arguments.contains("--stress") { try await stress() }
                 else if CommandLine.arguments.contains("--space-e2e") { try await spaceEndToEnd() }
                 else if CommandLine.arguments.contains("--order-e2e") { try await orderEndToEnd() }
@@ -88,15 +97,18 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                 }
                 else if CommandLine.arguments.contains("--inspect") { try await inspect() }
                 else { throw ManagerError("Specify --api, --e2e, or --inspect") }
+                try inputMonitor?.check()
                 let result:[String:Any] = ["passed":true,"completed":completed,"samples":samples]
                 let data = try JSONSerialization.data(withJSONObject:result,options:[.prettyPrinted,.sortedKeys])
                 if CommandLine.arguments.contains("--output") { try data.write(to:URL(fileURLWithPath:try argument("--output")),options:.atomic) }
                 print(String(data:data,encoding:.utf8)!); NSApp.terminate(nil)
             } catch {
-                fputs("AUDIT FAILED: \(error.localizedDescription)\n",stderr)
+                var message = error.localizedDescription
+                if let interference = inputMonitor?.interference { message = interference }
+                fputs("AUDIT FAILED: \(message)\n",stderr)
                 if CommandLine.arguments.contains("--output") {
                     do {
-                        let failure:[String:Any] = ["passed":false,"error":error.localizedDescription,"completed":completed,"samples":samples]
+                        let failure:[String:Any] = ["passed":false,"inconclusive":inputMonitor?.hadInterference == true,"error":message,"completed":completed,"samples":samples]
                         try JSONSerialization.data(withJSONObject:failure,options:[.prettyPrinted,.sortedKeys]).write(to:URL(fileURLWithPath:try argument("--output")),options:.atomic)
                     } catch { fputs("Cannot save the failed audit: \(error.localizedDescription)\n",stderr); exit(2) }
                 }
@@ -157,6 +169,12 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                     guard let global = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{_ in }),
                           let local = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{$0}) else { throw ManagerError("Cannot create event monitor") }
                     NSEvent.removeMonitor(global); NSEvent.removeMonitor(local)
+                case "audit-input":
+                    var monitor:AuditInputMonitor? = try AuditInputMonitor()
+                    weak let weakMonitor = monitor
+                    if cycle.isMultiple(of:2) { monitor!.close() }
+                    monitor = nil
+                    try require(weakMonitor == nil,"The GUI audit's input monitor remained alive after teardown")
                 case "running-app-observation":
                     var observation:NSKeyValueObservation? = NSWorkspace.shared.observe(\.runningApplications,options:[]) { workspace,_ in
                         _ = workspace.runningApplications
@@ -294,6 +312,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     }
 
     func state() throws -> [String:Any] {
+        try inputMonitor?.check()
         guard let diagnostics else { throw ManagerError("Missing diagnostics path") }
         guard let value = try JSONSerialization.jsonObject(with:Data(contentsOf:diagnostics)) as? [String:Any] else { throw ManagerError("Invalid diagnostics") }
         if let error = value["error"] as? String { throw ManagerError(error) }
@@ -305,6 +324,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     func wait(_ description:String,_ predicate:() throws -> Bool) async throws {
         let deadline = Date().addingTimeInterval(audit.timeout)
         while Date() < deadline {
+            try inputMonitor?.check()
             if try predicate() { return }
             try await Task.sleep(for:.seconds(audit.checkInterval))
         }
@@ -517,17 +537,21 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         try require(try WindowMetadata.statusIsVisible(WindowMetadata.current(maccy.window.id).bounds),"Maccy's icon did not remain visible")
         completed.append("Actual Maccy popup and restoration")
         if CommandLine.arguments.contains("--system") {
-            let catalog = try await Catalog.read(configuration)
-            guard let sound = catalog.items.first(where: { $0.key == "com.apple.controlcenter:com.apple.menuextra.sound" }) else { throw ManagerError("The system Sound item is missing") }
-            if !(try state()["hidden"] as! [String]).contains(sound.key) { try await select("Hide \(sound.name)") }
-            revealWindow = sound.window.id; expectedOrder = try await nativeOrder()
-            try await select("Show \(sound.name)")
-            try await click(sound.window.id); try await assertHeld()
-            try await escape(); try await assertHidden()
-            try await select("Keep \(sound.name) visible")
-            completed.append("Actual system Sound popup and restoration")
+            try await soundEndToEnd()
         }
         try sample("settled",0,managerPID)
+    }
+
+    func soundEndToEnd() async throws {
+        let catalog = try await Catalog.read(configuration)
+        guard let sound = catalog.items.first(where: { $0.key == "com.apple.controlcenter:com.apple.menuextra.sound" }) else { throw ManagerError("The system Sound item is missing") }
+        if !(try state()["hidden"] as! [String]).contains(sound.key) { try await select("Hide \(sound.name)") }
+        revealWindow = sound.window.id; expectedOrder = try await nativeOrder()
+        try await select("Show \(sound.name)")
+        try await click(sound.window.id); try await assertHeld()
+        try await escape(); try await assertHidden()
+        try await select("Keep \(sound.name) visible")
+        completed.append("Actual system Sound popup and restoration")
     }
     func restoreOrder() async throws {
         let data = try Data(contentsOf:URL(fileURLWithPath:argument("--restore-order")))
@@ -675,6 +699,43 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         completed.append("\(audit.cycles) native reveal-menu-dismiss-restore cycles after \(audit.warmupCycles) warmup cycles")
     }
 
+}
+
+@MainActor final class AuditInputMonitor {
+    private var global:Any?
+    private var local:Any?
+    private(set) var interference:String?
+    var hadInterference:Bool { interference != nil }
+
+    init() throws {
+        let mask:NSEvent.EventTypeMask = [.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.keyDown,.keyUp,.scrollWheel]
+        global = NSEvent.addGlobalMonitorForEvents(matching:mask) { [weak self] in self?.observe($0) }
+        guard global != nil else { throw ManagerError("Cannot monitor external input during the GUI audit") }
+        local = NSEvent.addLocalMonitorForEvents(matching:mask) { [weak self] event in self?.observe(event); return event }
+        guard local != nil else { close(); throw ManagerError("Cannot monitor local input during the GUI audit") }
+    }
+
+    private func observe(_ event:NSEvent) {
+        guard interference == nil else { return }
+        guard let event = event.cgEvent else {
+            interference = "An input event did not expose its source; this run is inconclusive"
+            return
+        }
+        let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+        if pid == getpid() || event.getIntegerValueField(.eventSourceUserData) == Movement.eventMarker { return }
+        interference = "External input (event \(event.type.rawValue), source process \(pid)) interfered with the GUI audit; this run is inconclusive"
+    }
+
+    func check() throws {
+        if let interference { throw ManagerError(interference) }
+    }
+
+    func close() {
+        if let global { NSEvent.removeMonitor(global); self.global = nil }
+        if let local { NSEvent.removeMonitor(local); self.local = nil }
+    }
+
+    isolated deinit { close() }
 }
 
 @MainActor final class SpaceCounter { var changes = 0 }

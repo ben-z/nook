@@ -77,7 +77,7 @@ This builds both architectures, checks the packaged and extracted app signatures
 
 CI runs these checks on both [Apple Silicon and Intel macOS 26 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). Hosted CI does not run the interactive GUI suite or establish long-term memory stability.
 
-The interactive harness is `NookAudit`; `Nook Fixture.app` supplies a harmless test icon and native interfaces. These tests require an unlocked Mac with Accessibility granted to the test executables. The complete suite also requires Maccy, Tailscale and the system Sound icon. It moves icons and quits/relaunches the fixture, so run it on a desktop you can observe.
+The interactive harness is `NookAudit`; `Nook Fixture.app` supplies a harmless test icon and native interfaces. These tests require an unlocked Mac with Accessibility granted to the test executables. The complete suite also requires Maccy, Tailscale and the system Sound icon. It moves icons and quits/relaunches the fixture. Keep the mouse and keyboard idle while it runs. Outside clicks, typing and scrolling make the GUI audit fail as inconclusive.
 
 ```sh
 .build/apple/Products/Release/NookAudit --e2e --system \
@@ -85,11 +85,11 @@ The interactive harness is `NookAudit`; `Nook Fixture.app` supplies a harmless t
   --diagnostics <nook-diagnostics.json> --output <result.json>
 ```
 
-Launch the test Nook process with `--diagnostics <nook-diagnostics.json>` to create the required state file. Other harness modes cover three-icon order, fullscreen Spaces, source lifecycle, repeated interaction and API allocation/teardown. Missing prerequisites are errors.
+Launch the test Nook process with `--diagnostics <nook-diagnostics.json>` to create the required state file. Other harness modes cover three-icon order, fullscreen Spaces, source lifecycle, repeated interaction and API allocation/teardown. Use `--sound-e2e --cycles 20` with the same process and diagnostics arguments to repeat the native Sound popup and restoration case. Add `--trace-movement` when launching Nook to log drag transactions and changing window bounds. Missing prerequisites are errors.
 
 Known limits:
 
-- Icon order can change during native layout updates, and restoration can time out. The system Sound case has exposed this failure.
+- Native icon movement can time out during layout changes. Moving an icon clipped by a display notch has failed in testing. Nook reports movement failures explicitly.
 - Some apps do not expose usable or stable Accessibility identities. The selector reports inspection errors.
 - External displays, display hot-plug and helper-owned popovers beyond the tested cases are not validated.
 - Finite heap scans and repeated-use tests cannot exclude leaks over days of use. The protected WindowServer heap has not been audited.

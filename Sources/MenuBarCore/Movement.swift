@@ -17,6 +17,9 @@ public enum Placement { case left, right }
         try require(!isMoving,"Another menu-bar movement is in progress")
         try require(AXIsProcessTrusted() && CGPreflightPostEventAccess(),"Accessibility permission is required to move icons")
         try require(NSEvent.pressedMouseButtons == 0,"Release the mouse button before moving an icon")
+        if CommandLine.arguments.contains("--trace-movement") {
+            fputs("Begin drag \(item) relative to \(anchor), pid \(sourcePID), time \(ProcessInfo.processInfo.systemUptime)\n",stderr)
+        }
         _ = try await WindowMetadata.settledStatusWindows(configuration)
         let window = try WindowMetadata.current(item)
         let hostPID = sourcePID
