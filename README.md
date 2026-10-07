@@ -12,11 +12,13 @@ Nook hides a group of icons and lets you reveal one when you need it. You use th
 ## Use Nook
 
 1. Click Nook's menu-bar button, or press **Control–Option–M**.
-2. Choose **Hide _app_** to add an icon to the hidden group.
+2. Open **Manage icons** and choose **Hide _app_** to add an icon to the hidden group.
 3. Choose **Show _app_** to reveal it, then click the actual icon to use it.
 4. Close its menu, popover, panel or window. Nook hides the icon after a short grace period.
 
-Choose **Keep _app_ visible** to take an icon out of the hidden group. **Launch at login** is optional. The Clock and Control Center stay visible.
+In **Manage icons**, choose **Keep _app_ visible** to take an icon out of the hidden group. **Launch at login** is optional. The Clock and Control Center stay visible.
+
+If an action fails, Nook marks its button and provides details in its menu. **Retry hiding the icon** is available when Nook still has its original position. Close the app's open interfaces before retrying. Quitting Nook shows the hidden group.
 
 Automatic hiding waits while a native interface is open, the manager menu is open, or a mouse button is held. Reopening an interface cancels a pending hide. Nook remembers hidden selections when an app quits and relaunches.
 
@@ -77,7 +79,7 @@ This builds both architectures, checks the packaged and extracted app signatures
 
 CI runs these checks on both [Apple Silicon and Intel macOS 26 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). Hosted CI does not run the interactive GUI suite or establish long-term memory stability.
 
-The interactive harness is `NookAudit`; `Nook Fixture.app` supplies a harmless test icon and native interfaces. These tests require an unlocked Mac with Accessibility granted to the test executables. The complete suite also requires Maccy, Tailscale and the system Sound icon. It moves icons and quits/relaunches the fixture. Keep the mouse and keyboard idle while it runs. Outside clicks, typing and scrolling make the GUI audit fail as inconclusive.
+The interactive harness is `NookAudit`; `Nook Fixture.app` supplies a harmless test icon and native interfaces. These tests require an unlocked Mac with Accessibility granted to the test executables. The complete suite also requires Maccy, Tailscale and the system Sound icon. It moves icons and quits/relaunches the fixture. Keep the mouse and keyboard idle while it runs. Outside clicks, typing, scrolling and locking the Mac make the GUI audit fail as inconclusive.
 
 ```sh
 .build/apple/Products/Release/NookAudit --e2e --system \
@@ -90,7 +92,8 @@ Launch the test Nook process with `--diagnostics <nook-diagnostics.json>` to cre
 Known limits:
 
 - Native icon movement can time out during layout changes. Moving an icon clipped by a display notch has failed in testing. Nook reports movement failures explicitly.
-- Some apps do not expose usable or stable Accessibility identities. The selector reports inspection errors.
+- Some apps do not expose usable or stable Accessibility identities. Nook reports unavailable native icons and preserves inspection errors for real icon providers.
+- Native Command-drags can move the pointer and interfere with simultaneous mouse input.
 - External displays, display hot-plug and helper-owned popovers beyond the tested cases are not validated.
 - Finite heap scans and repeated-use tests cannot exclude leaks over days of use. The protected WindowServer heap has not been audited.
 - Intel builds are compiled and tested in CI; interactive behavior has been tested on Apple Silicon.

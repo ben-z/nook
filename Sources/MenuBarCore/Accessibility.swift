@@ -92,12 +92,14 @@ public struct Catalog: Sendable {
         var owned = [String:Owned]()
         func bindWindow(_ key:String,pid:pid_t,window:CGWindowID) { owned[key] = Owned(pid:pid,window:window) }
     func inspect(_ applications:[Application],configuration:Configuration) throws -> Catalog {
-        var items = [MenuBarItem](); var errors = Set<String>(); var observed = [String:Identity]()
+        var items = [MenuBarItem](); var errors = Set<String>(); var rootErrors = Set<String>(); var observed = [String:Identity]()
         for application in applications {
             let identifier = application.identifier; let name = application.name
+            var foundBar = false
             do {
                 let root = AXUIElementCreateApplication(application.pid)
                 guard let value = try Accessibility.optional(root,kAXExtrasMenuBarAttribute) else { continue }
+                foundBar = true
                 let bar = try Accessibility.element(value)
                 let elements = try Accessibility.children(bar).map { ($0,try Accessibility.bounds($0)) }.filter { $0.1.width > 0 && $0.1.height > 0 }
                 for (element,_) in elements {
@@ -121,16 +123,33 @@ public struct Catalog: Sendable {
                     else { itemName = name }
                     items.append(MenuBarItem(key:key,name:itemName,bundleIdentifier:identifier,sourcePID:application.pid,window:window))
                 }
-            } catch { errors.insert("\(name): \(error.localizedDescription)") }
+            } catch {
+                let message = "\(name): \(error.localizedDescription)"
+                if foundBar { errors.insert(message) }
+                else { rootErrors.insert(message) }
+            }
         }
         identities = observed
         owned = owned.filter { entry in applications.contains { $0.pid == entry.value.pid } }
         let grouped = Dictionary(grouping:items,by:\.key)
         try require(grouped.values.allSatisfy {$0.count == 1}, "Menu-bar identities are ambiguous; management is unsafe")
         try require(Set(items.map { $0.window.id }).count == items.count,"Multiple applications claim the same menu-bar surface")
-        return Catalog(items:items.sorted {$0.name.localizedStandardCompare($1.name) == .orderedAscending},inspectionErrors:errors.sorted())
+        let native = Set(try WindowMetadata.statusWindows(configuration).map(\.id))
+        let issues = Catalog.issues(native:native,identified:Set(items.map { $0.window.id }),itemErrors:errors,rootErrors:rootErrors)
+        return Catalog(items:items.sorted {$0.name.localizedStandardCompare($1.name) == .orderedAscending},inspectionErrors:issues)
     }
 
+    }
+
+    static func issues(native:Set<CGWindowID>,identified:Set<CGWindowID>,itemErrors:Set<String>,rootErrors:Set<String>) -> [String] {
+        let missing = native.subtracting(identified)
+        var issues = itemErrors
+        if !missing.isEmpty {
+            let noun = missing.count == 1 ? "icon" : "icons"
+            issues.insert("\(missing.count) menu-bar \(noun) could not be identified")
+            issues.formUnion(rootErrors)
+        }
+        return issues.sorted()
     }
 
     static func locate(_ element:AXUIElement,name:String,configuration:Configuration,excluding:Set<CGWindowID>) throws -> WindowMetadata {

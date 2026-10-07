@@ -69,4 +69,16 @@ final class RevealStateTests:XCTestCase {
         XCTAssertNoThrow(try state.begin())
     }
 
+    func testRecoveryIsAnExclusiveCancelableTransition() throws {
+        var state = RevealState(); _ = try state.begin(); state.fail()
+        let token = try state.retryHiding()
+        XCTAssertEqual(state.phase,.hiding)
+        XCTAssertThrowsError(try state.begin())
+        XCTAssertThrowsError(try state.retryHiding())
+        state.cancelTransition()
+        XCTAssertNotEqual(state.generation,token)
+        XCTAssertEqual(state.phase,.stopping)
+        state.finish(); XCTAssertNoThrow(try state.begin())
+    }
+
 }

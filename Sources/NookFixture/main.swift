@@ -10,6 +10,7 @@ import MenuBarCore
     var dialog:NSWindow!
     func applicationDidFinishLaunching(_ notification:Notification) {
         item = NSStatusBar.system.statusItem(withLength:configuration.controlWidth)
+        item.autosaveName = "Nook.Fixture"
         item.button!.title = "T"
         item.button!.setAccessibilityIdentifier("fixture-status-item")
         menu = NSMenu(title:"Fixture")

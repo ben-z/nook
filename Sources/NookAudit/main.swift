@@ -30,6 +30,11 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     return info.ri_phys_footprint
 }
 
+struct AuditInterference:LocalizedError {
+    let message:String
+    var errorDescription:String? { message }
+}
+
 @MainActor final class Audit:NSObject,NSApplicationDelegate {
     let configuration = Configuration()
     var audit = AuditConfiguration()
@@ -108,7 +113,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                 fputs("AUDIT FAILED: \(message)\n",stderr)
                 if CommandLine.arguments.contains("--output") {
                     do {
-                        let failure:[String:Any] = ["passed":false,"inconclusive":inputMonitor?.hadInterference == true,"error":message,"completed":completed,"samples":samples]
+                        let failure:[String:Any] = ["passed":false,"inconclusive":error is AuditInterference || inputMonitor?.hadInterference == true,"error":message,"completed":completed,"samples":samples]
                         try JSONSerialization.data(withJSONObject:failure,options:[.prettyPrinted,.sortedKeys]).write(to:URL(fileURLWithPath:try argument("--output")),options:.atomic)
                     } catch { fputs("Cannot save the failed audit: \(error.localizedDescription)\n",stderr); exit(2) }
                 }
@@ -377,6 +382,10 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         guard let completed = try state()["completedActions"] as? UInt64 else { throw ManagerError("No completed action counter") }
         guard let control = try state()["controlWindow"] as? UInt32 else { throw ManagerError("No control window") }
         try await click(control)
+        if title.hasPrefix("Hide ") && !title.hasSuffix(" now") || title.hasPrefix("Keep ") {
+            let manage = try await row(pid:managerPID,title:"Manage icons")
+            try Accessibility.check(AXUIElementPerformAction(manage,kAXPressAction as CFString),"Open Manage icons")
+        }
         let element = try await row(pid:managerPID,title:title)
         try Accessibility.check(AXUIElementPerformAction(element,kAXPressAction as CFString),"Select \(title)")
         try await wait("menu selection completed") { try state()["completedActions"] as! UInt64 > completed && state()["busy"] as? Bool == false && state()["managerMenuOpen"] as? Bool == false }
@@ -708,6 +717,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     var hadInterference:Bool { interference != nil }
 
     init() throws {
+        try check()
         let mask:NSEvent.EventTypeMask = [.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.keyDown,.keyUp,.scrollWheel]
         global = NSEvent.addGlobalMonitorForEvents(matching:mask) { [weak self] in self?.observe($0) }
         guard global != nil else { throw ManagerError("Cannot monitor external input during the GUI audit") }
@@ -727,7 +737,16 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     }
 
     func check() throws {
-        if let interference { throw ManagerError(interference) }
+        guard let session = CGSessionCopyCurrentDictionary() as? [String:Any] else {
+            throw ManagerError("Cannot read the graphical login session")
+        }
+        try require(session["kCGSSessionOnConsoleKey"] as? Bool == true && session["kCGSessionLoginDoneKey"] as? Bool == true,
+                    "GUI audits require a logged-in console session")
+        if let value = session["CGSSessionScreenIsLocked"] {
+            guard let locked = value as? Bool else { throw ManagerError("The graphical session's lock state has an invalid type") }
+            if locked { interference = "The Mac is locked. Unlock it before running GUI audits; this run is inconclusive" }
+        }
+        if let interference { throw AuditInterference(message:interference) }
     }
 
     func close() {

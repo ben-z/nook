@@ -34,6 +34,11 @@ public struct RevealState {
         try require(token == generation && canHide,"The reveal session is not safe to hide")
         phase = .hiding
     }
+    public mutating func retryHiding() throws -> UInt64 {
+        try require(phase == .failed,"No failed reveal needs restoration")
+        generation += 1; phase = .hiding
+        return generation
+    }
     public mutating func cancelTransition() {
         precondition(phase == .revealing || phase == .hiding)
         generation += 1; phase = .stopping
