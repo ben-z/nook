@@ -46,6 +46,7 @@ struct AuditInterference:LocalizedError {
     var revealWindow:CGWindowID?
     var expectedOrder:[CGWindowID]?
     var inputMonitor:AuditInputMonitor?
+    var expectedFailure:String?
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         Task { @MainActor in
@@ -59,7 +60,7 @@ struct AuditInterference:LocalizedError {
                     guard let every = Int(try argument("--sample-every")),every > 0 else { throw ManagerError("Invalid sampling interval") }
                     audit.sampleEvery = every
                 }
-                if ["--e2e","--sound-e2e","--stress","--space-e2e","--order-e2e","--lifecycle-e2e","--restore-order","--restore","--select"].contains(where:CommandLine.arguments.contains) {
+                if ["--e2e","--sound-e2e","--stress","--space-e2e","--order-e2e","--lifecycle-e2e","--input-e2e","--restore-order","--restore","--select"].contains(where:CommandLine.arguments.contains) {
                     inputMonitor = try AuditInputMonitor()
                 }
                 defer { inputMonitor?.close() }
@@ -73,6 +74,7 @@ struct AuditInterference:LocalizedError {
                 else if CommandLine.arguments.contains("--space-e2e") { try await spaceEndToEnd() }
                 else if CommandLine.arguments.contains("--order-e2e") { try await orderEndToEnd() }
                 else if CommandLine.arguments.contains("--lifecycle-e2e") { try await lifecycleEndToEnd() }
+                else if CommandLine.arguments.contains("--input-e2e") { try await inputEndToEnd() }
                 else if CommandLine.arguments.contains("--press") { try await pressStatusItem() }
                 else if CommandLine.arguments.contains("--press-title") {
                     guard let pid = pid_t(try argument("--pid")) else { throw ManagerError("Invalid process ID") }
@@ -144,9 +146,15 @@ struct AuditInterference:LocalizedError {
             reusedGroup = HiddenGroup(item:reusedItem!,window:window.id,configuration:configuration,movement:Movement(configuration:configuration))
         } else { reusedGroup = nil }
         for cycle in 1...audit.cycles {
+            weak var removedGlobal:TimerFlag?
+            weak var removedLocal:TimerFlag?
             try autoreleasepool {
                 switch name {
-                case "pressed-mouse-buttons": _ = NSEvent.pressedMouseButtons
+                case "pressed-mouse-buttons":
+                    _ = NSEvent.pressedMouseButtons; _ = NSEvent.modifierFlags
+                    for type in [CGEventType.mouseMoved,.scrollWheel,.keyDown,.keyUp,.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp] {
+                        _ = CGEventSource.secondsSinceLastEventType(.combinedSessionState,eventType:type)
+                    }
                 case "window-metadata":
                     let list = try WindowMetadata.statusWindows(configuration)
                     try require(!list.isEmpty,"No status windows")
@@ -171,8 +179,10 @@ struct AuditInterference:LocalizedError {
                     delivery = nil
                     try require(weakDelivery == nil && DragDelivery.liveCount == 0,"The drag event channels were retained after teardown")
                 case "mouse-monitors":
-                    guard let global = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{_ in }),
-                          let local = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{$0}) else { throw ManagerError("Cannot create event monitor") }
+                    let globalFlag = TimerFlag(); let localFlag = TimerFlag()
+                    removedGlobal = globalFlag; removedLocal = localFlag
+                    guard let global = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{[globalFlag] _ in globalFlag.fired = true }),
+                          let local = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{[localFlag] event in localFlag.fired = true; return event}) else { throw ManagerError("Cannot create event monitor") }
                     NSEvent.removeMonitor(global); NSEvent.removeMonitor(local)
                 case "audit-input":
                     var monitor:AuditInputMonitor? = try AuditInputMonitor()
@@ -249,15 +259,41 @@ struct AuditInterference:LocalizedError {
                     defaults.set(["test"],forKey:"hiddenKeys")
                     try require(defaults.array(forKey:"hiddenKeys") as? [String] == ["test"],"Preference round trip failed")
                     defaults.removePersistentDomain(forName:"com.benzhang.nook.memoryaudit")
-                case "timers","catalog","status-resize-settled": break
+                case "timers","catalog","status-resize-settled","drag-timeout","drag-cancellation","drag-close": break
                 default: throw ManagerError("Unknown API group \(name)")
                 }
+            }
+            if name == "mouse-monitors" {
+                try require(removedGlobal == nil && removedLocal == nil,"A removed mouse monitor retained its handler")
             }
             if name == "status-resize-settled" {
                 guard let reusedGroup else { throw ManagerError("Missing reusable status group") }
                 try await reusedGroup.expanded(true); try await reusedGroup.expanded(false)
             }
             if name == "catalog" { _ = try await Catalog.read(configuration) }
+            if ["drag-timeout","drag-cancellation","drag-close"].contains(name) {
+                var delivery:DragDelivery? = try DragDelivery(pid:target.processIdentifier,configuration:configuration)
+                weak let weakDelivery = delivery
+                guard let event = CGEvent(source:nil) else { throw ManagerError("Cannot allocate the test packet") }
+                // A null payload cannot reach the mouse receipt channel and changes no input state.
+                let sender = Task { @MainActor [delivery = delivery!] in try await delivery.send(event,repetitions:1) }
+                if name == "drag-cancellation" || name == "drag-close" {
+                    try await Task.sleep(for:.seconds(audit.checkInterval))
+                    if name == "drag-cancellation" { sender.cancel() }
+                    else { delivery!.close() }
+                }
+                do {
+                    try await sender.value
+                    throw ManagerError("The deliberately unacknowledged packet unexpectedly succeeded")
+                } catch is CancellationError {
+                    try require(name == "drag-cancellation","A timeout packet was canceled unexpectedly")
+                } catch let error as ManagerError {
+                    let expected = name == "drag-close" ? "The native drag channel closed during delivery":"The application did not acknowledge the drag packet"
+                    try require(name != "drag-cancellation" && error.message == expected,"Unexpected drag failure: \(error.localizedDescription)")
+                }
+                delivery!.close(); delivery = nil
+                try require(weakDelivery == nil && DragDelivery.liveCount == 0,"Drag delivery remained alive after the pending packet ended")
+            }
             if name == "timers" {
                 let flag = TimerFlag()
                 let timer = Timer(timeInterval:audit.timerInterval,repeats:false) { [weak flag] _ in MainActor.assumeIsolated { flag?.fired = true } }
@@ -271,6 +307,10 @@ struct AuditInterference:LocalizedError {
             }
         }
         try await Task.sleep(for:.seconds(configuration.gracePeriod))
+        if CommandLine.arguments.contains("--hold-for-leaks") {
+            guard let seconds = TimeInterval(try argument("--hold-for-leaks")),seconds > 0 else { throw ManagerError("Invalid heap-scan hold interval") }
+            try await Task.sleep(for:.seconds(seconds))
+        }
         try sample("settled",audit.cycles,getpid())
         completed.append("\(name): \(audit.cycles) cycles")
     }
@@ -320,8 +360,8 @@ struct AuditInterference:LocalizedError {
         try inputMonitor?.check()
         guard let diagnostics else { throw ManagerError("Missing diagnostics path") }
         guard let value = try JSONSerialization.jsonObject(with:Data(contentsOf:diagnostics)) as? [String:Any] else { throw ManagerError("Invalid diagnostics") }
-        if let error = value["error"] as? String { throw ManagerError(error) }
-        if let error = value["failure"] as? String { throw ManagerError(error) }
+        if let error = value["error"] as? String, error != expectedFailure { throw ManagerError(error) }
+        if let error = value["failure"] as? String, error != expectedFailure { throw ManagerError(error) }
         try require(value["pid"] as? pid_t == managerPID,"Diagnostics belong to another process")
         return value
     }
@@ -338,6 +378,11 @@ struct AuditInterference:LocalizedError {
 
     func click(_ id:CGWindowID) async throws {
         let frame = try WindowMetadata.current(id).bounds
+        try await click(frame)
+    }
+
+    func click(_ frame:CGRect) async throws {
+        try require(frame.width > 0 && frame.height > 0,"The test click target has no visible bounds")
         let point = CGPoint(x:frame.midX,y:frame.midY)
         guard let down = CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:point,mouseButton:.left),
               let up = CGEvent(mouseEventSource:nil,mouseType:.leftMouseUp,mouseCursorPosition:point,mouseButton:.left) else { throw ManagerError("Cannot create test click") }
@@ -438,6 +483,16 @@ struct AuditInterference:LocalizedError {
             guard let key = entry["key"] as? String, let pid = entry["pid"] as? pid_t, let window = entry["window"] as? CGWindowID else { throw ManagerError("Invalid native item identity") }
             await Catalog.bindWindow(key,pid:pid,window:window)
         }
+        let value = try state()
+        guard let hidden = value["hidden"] as? [String],let divider = value["dividerWindow"] as? CGWindowID else { throw ManagerError("Missing hidden-group configuration") }
+        let boundary = try WindowMetadata.current(divider).bounds.minX
+        for entry in identities {
+            let pid = entry["pid"] as! pid_t
+            if pid == managerPID { continue }
+            let key = entry["key"] as! String
+            let bounds = try WindowMetadata.current(entry["window"] as! CGWindowID).bounds
+            try require((bounds.maxX <= boundary+configuration.geometryTolerance) == hidden.contains(key),"The hidden group does not match the selected icons: \(key)")
+        }
     }
 
     func endToEnd() async throws {
@@ -468,7 +523,7 @@ struct AuditInterference:LocalizedError {
             try await select("Show \(name)")
             try await click(fixture.window.id)
             let menuItem = try await row(pid:fixturePID,title:title)
-            try Accessibility.check(AXUIElementPerformAction(menuItem,kAXPressAction as CFString),title)
+            try await click(Accessibility.bounds(menuItem))
             let close = try await row(pid:fixturePID,title:button)
             try await assertHeld()
             try Accessibility.check(AXUIElementPerformAction(close,kAXPressAction as CFString),button)
@@ -476,7 +531,7 @@ struct AuditInterference:LocalizedError {
         }
         try await select("Show \(name)")
         try await click(fixture.window.id)
-        try await wait("menu opened") { try state()["menus"] as! Int > 0 }
+        try await wait("menu opened") { try state()["interfaces"] as! Int > 0 }
         try await escape()
         try await wait("native menu closed before reopening") {
             try state()["menus"] as? Int == 0 && WindowMetadata.list(.optionOnScreenOnly,relativeTo:0).allSatisfy {
@@ -484,7 +539,7 @@ struct AuditInterference:LocalizedError {
             }
         }
         try await click(fixture.window.id)
-        try await wait("native menu reopened before restoration") { try state()["menus"] as! Int > 0 }
+        try await wait("native menu reopened before restoration") { try state()["interfaces"] as! Int > 0 }
         try await assertHeld(); try await escape(); try await assertHidden()
         completed.append("Reopening cancels an older pending hide")
 
@@ -522,6 +577,20 @@ struct AuditInterference:LocalizedError {
         rightUp.post(tap:.cghidEventTap)
         try await assertHidden(); clickWindow.close()
         completed.append("Automatic hiding waits until every pressed mouse button is released")
+
+        try await select("Show \(name)")
+        try await select("Hide \(name) now")
+        guard let pointer = CGEvent(source:nil)?.location else { throw ManagerError("Cannot read the test pointer") }
+        let motionDeadline = Date().addingTimeInterval(audit.interactionHold)
+        while Date() < motionDeadline {
+            guard let motion = CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:pointer,mouseButton:.left) else { throw ManagerError("Cannot allocate the motion test") }
+            motion.setIntegerValueField(.eventSourceUserData,value:Movement.eventMarker)
+            motion.post(tap:.cghidEventTap)
+            try await Task.sleep(for:.seconds(audit.checkInterval))
+            try require(try state()["phase"] as? String == "visible","Icon hid during continuous pointer motion")
+        }
+        try await assertHidden()
+        completed.append("Pending automatic hiding waits for pointer motion to stop")
 
         try await select("Show \(name)")
         try await key(CGKeyCode(configuration.hotKeyCode),flags:[.maskControl,.maskAlternate])
@@ -673,6 +742,36 @@ struct AuditInterference:LocalizedError {
         completed.append("Quitting during restoration completes native cleanup and preserves surviving icon order")
         try sample("settled",0,managerPID)
         print("FIXTURE TERMINATED \(relaunched.processIdentifier)")
+    }
+
+    func inputEndToEnd() async throws {
+        try await connectManager()
+        let fixture = try await item("com.benzhang.nook.fixture")
+        if !(try state()["hidden"] as! [String]).contains(fixture.key) { try await select("Hide \(fixture.name)") }
+        revealWindow = fixture.window.id; expectedOrder = try await nativeOrder()
+        audit.timeout = configuration.inputWaitTimeout + audit.timeout
+        expectedFailure = "Pause mouse and keyboard input briefly so Nook can move the icon"
+        let motion = Task { @MainActor in
+            while !Task.isCancelled {
+                guard let pointer = CGEvent(source:nil)?.location,
+                      let event = CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:pointer,mouseButton:.left) else { throw ManagerError("Cannot allocate active-input test event") }
+                event.setIntegerValueField(.eventSourceUserData,value:Movement.eventMarker)
+                event.post(tap:.cghidEventTap)
+                do { try await Task.sleep(for:.seconds(configuration.movementCheckInterval)) }
+                catch is CancellationError { return }
+            }
+        }
+        defer { motion.cancel(); expectedFailure = nil }
+        try await select("Show \(fixture.name)")
+        let failed = try state()
+        try require(failed["phase"] as? String == "failed" && failed["error"] as? String == expectedFailure,"Continuous input did not produce the expected movement timeout")
+        try require(failed["resources"] as? Int == 0 && failed["dragChannels"] as? Int == 0 && failed["observers"] as? Int == 0,"The failed reveal retained its interaction resources")
+        try require(try await nativeOrder() == expectedOrder,"An input timeout changed native icon order")
+        motion.cancel(); try await motion.value
+        try await select("Retry hiding the icon")
+        try await assertHidden()
+        try require(try state()["error"] == nil && state()["failure"] == nil,"Recovery retained a stale error")
+        completed.append("Continuous input leaves icon order untouched, releases reveal resources, and offers a working restoration retry")
     }
 
     func stress() async throws {

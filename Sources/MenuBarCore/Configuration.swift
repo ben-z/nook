@@ -7,6 +7,10 @@ public struct Configuration: Sendable {
     public var movementTimeout: TimeInterval = 1
     public var movementCheckInterval: TimeInterval = 0.02
     public var layoutSettlementPeriod:TimeInterval = 0.12
+    public var inputQuietPeriod:TimeInterval = 0.1
+    public var restorationQuietPeriod:TimeInterval = 0.25
+    public var inputWaitTimeout:TimeInterval = 10
+    public var dragTimeout:TimeInterval = 0.15
     public var expandedDividerWidth: CGFloat = 10_000
     public var controlWidth: CGFloat = 20
     public var dividerWidth: CGFloat = 8

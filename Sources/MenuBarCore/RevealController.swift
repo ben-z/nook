@@ -28,8 +28,9 @@ import ApplicationServices
     private func transientWindows() throws -> Set<CGWindowID> {
         guard let item else { throw ManagerError("No revealed item") }
         return Set(try WindowMetadata.list(.optionOnScreenOnly,relativeTo:0).filter { window in
-            window.pid == item.sourcePID && window.bounds.height > configuration.maximumStatusWindowHeight &&
-            (window.layer > Int(CGWindowLevelForKey(.normalWindow)) || !baselineWindows.contains(window.id))
+            window.pid == item.sourcePID && window.bounds.height > 0 &&
+            ((window.layer > Int(CGWindowLevelForKey(.normalWindow)) && window.layer != Int(CGWindowLevelForKey(.statusWindow))) ||
+             (window.bounds.height > configuration.maximumStatusWindowHeight && !baselineWindows.contains(window.id)))
         }.map(\.id))
     }
 
@@ -161,7 +162,8 @@ import ApplicationServices
         guard token == state.generation, state.phase == .visible else { return }
         try refreshInterfaces()
         changed?()
-        if !state.canHide { return }
+        if !state.canHide { armTimer(); return }
+        if !UserInput.isIdle(for:configuration.restorationQuietPeriod) { armTimer(); return }
         try state.hiding(token); changed?()
         guard let item else { throw ManagerError("Missing restoration information") }
         try await group.restore(item,order:hiddenOrder)

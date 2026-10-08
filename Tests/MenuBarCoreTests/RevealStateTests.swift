@@ -39,6 +39,14 @@ final class RevealStateTests:XCTestCase {
         XCTAssertTrue(state.shouldCheckClosure); XCTAssertFalse(state.canHide)
         state.interfaces(0); XCTAssertTrue(state.canHide)
     }
+    func testNativeClosureReconcilesMissingMenuClosedNotification() throws {
+        var state = RevealState(); _ = try state.begin(); state.revealed()
+        state.menuOpened(AXElementIdentity(AXUIElementCreateApplication(1)))
+        state.interfaces(2); state.interfaces(1)
+        XCTAssertFalse(state.canHide); XCTAssertEqual(state.menus.count,1)
+        state.interfaces(0)
+        XCTAssertTrue(state.canHide); XCTAssertTrue(state.menus.isEmpty)
+    }
     func testDuplicateOpenNotificationDoesNotRetainMenu() throws {
         var state = RevealState(); _ = try state.begin(); state.revealed()
         let menu = AXElementIdentity(AXUIElementCreateApplication(1))

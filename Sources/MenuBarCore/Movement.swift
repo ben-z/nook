@@ -16,11 +16,13 @@ public enum Placement { case left, right }
     public func move(_ item: CGWindowID, sourcePID:pid_t, relativeTo anchor: CGWindowID, placement: Placement) async throws {
         try require(!isMoving,"Another menu-bar movement is in progress")
         try require(AXIsProcessTrusted() && CGPreflightPostEventAccess(),"Accessibility permission is required to move icons")
-        try require(NSEvent.pressedMouseButtons == 0,"Release the mouse button before moving an icon")
+        isMoving = true
+        defer { isMoving = false }
         if CommandLine.arguments.contains("--trace-movement") {
             fputs("Begin drag \(item) relative to \(anchor), pid \(sourcePID), time \(ProcessInfo.processInfo.systemUptime)\n",stderr)
         }
         _ = try await WindowMetadata.settledStatusWindows(configuration)
+        try await UserInput.waitUntilIdle(configuration:configuration)
         let window = try WindowMetadata.current(item)
         let hostPID = sourcePID
         let original = window.bounds
@@ -44,7 +46,10 @@ public enum Placement { case left, right }
         let initialPosition = try position()
         try require(initialPosition != .settling,"An icon disappeared before movement")
         if initialPosition == .adjacent { return }
-        guard let source = CGEventSource(stateID:.hidSystemState), let pointer = CGEvent(source:nil)?.location,
+        if sourcePID != getpid(), target.minX >= CGDisplayBounds(CGMainDisplayID()).minX {
+            try require(try WindowMetadata.statusIsVisible(target),"The destination icon is clipped by the display notch. Hide other icons to make room before moving it.")
+        }
+        guard let source = CGEventSource(stateID:.hidSystemState),
               let windowField = CGEventField(rawValue:0x33) else { throw ManagerError("Cannot create the menu-bar drag event") }
         source.localEventsSuppressionInterval = 0
         guard let sessionSource = CGEventSource(stateID:.combinedSessionState) else { throw ManagerError("Cannot configure native event delivery") }
@@ -69,7 +74,6 @@ public enum Placement { case left, right }
         func event(_ type:CGEventType,_ point:CGPoint,_ window:CGWindowID) throws -> CGEvent {
             guard let event = CGEvent(mouseEventSource:source,mouseType:type,mouseCursorPosition:point,mouseButton:.left) else { throw ManagerError("Cannot allocate mouse event") }
             event.flags = type == .leftMouseUp ? []:.maskCommand
-            event.setIntegerValueField(.eventTargetUnixProcessID,value:Int64(hostPID))
             event.setIntegerValueField(.eventSourceUserData,value:Self.eventMarker)
             event.setIntegerValueField(.mouseEventWindowUnderMousePointer,value:Int64(window))
             event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent,value:Int64(window))
@@ -81,35 +85,38 @@ public enum Placement { case left, right }
         let release = try event(.leftMouseUp,CGPoint(x:original.midX,y:original.minY),item)
         let delivery = try DragDelivery(pid:hostPID,configuration:configuration)
         defer { delivery.close() }
-        try require(CGDisplayHideCursor(CGMainDisplayID()) == .success,"Cannot hide the pointer during movement")
-        isMoving = true
-        defer {
-            let restored = CGWarpMouseCursorPosition(pointer)
-            let shown = CGDisplayShowCursor(CGMainDisplayID())
-            isMoving = false
-            precondition(restored == .success && shown == .success,"Cannot restore the pointer after movement")
-        }
+        try await UserInput.waitUntilIdle(configuration:configuration)
+        try require(try WindowMetadata.current(item).bounds == original && WindowMetadata.current(anchor).bounds == target,"The menu-bar layout changed before movement; try again")
+        guard let pointer = CGEvent(source:nil)?.location else { throw ManagerError("Cannot read the pointer before movement") }
         do {
-            try await delivery.send(down,repetitions:1)
-            let responseDeadline = Date().addingTimeInterval(configuration.movementTimeout)
-            while try WindowMetadata.current(item).bounds.origin == original.origin {
-                try require(Date() < responseDeadline,"The status item did not acknowledge the drag start")
-                try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
+            try require(CGDisplayHideCursor(CGMainDisplayID()) == .success,"Cannot hide the pointer during movement")
+            defer {
+                let restored = CGWarpMouseCursorPosition(pointer)
+                let shown = CGDisplayShowCursor(CGMainDisplayID())
+                precondition(restored == .success && shown == .success,"Cannot restore the pointer after movement")
             }
-            _ = try await WindowMetadata.settledStatusWindows(configuration)
-            let destination = try WindowMetadata.current(anchor).bounds
-            // Lifting an icon clamps it to the display edge and shifts offscreen anchors.
-            if placement == .left && target.maxX < CGDisplayBounds(CGMainDisplayID()).minX {
-                end = CGPoint(x:destination.minX,y:destination.minY)
+            do {
+                try await delivery.send(down,repetitions:1)
+                let responseDeadline = Date().addingTimeInterval(configuration.dragTimeout)
+                while try WindowMetadata.current(item).bounds.origin == original.origin {
+                    try require(Date() < responseDeadline,"The status item did not acknowledge the drag start")
+                    try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
+                }
+                let lifted = try WindowMetadata.current(item).bounds.origin
+                if CommandLine.arguments.contains("--trace-movement") {
+                    fputs("Drag \(item): initial \(original), target \(target), down \(start), lifted \(try WindowMetadata.current(item).bounds), updated target \(try WindowMetadata.current(anchor).bounds), up \(end)\n",stderr)
+                }
+                let up = try event(.leftMouseUp,end,anchor)
+                try await delivery.send(up,repetitions:2)
+                let upDeadline = Date().addingTimeInterval(configuration.dragTimeout)
+                while try WindowMetadata.current(item).bounds.origin == lifted {
+                    try require(Date() < upDeadline,"The status item did not acknowledge the drag end")
+                    try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
+                }
+            } catch {
+                for _ in 0..<2 { release.post(tap:.cgSessionEventTap); release.postToPid(hostPID) }
+                throw error
             }
-            if CommandLine.arguments.contains("--trace-movement") {
-                fputs("Drag \(item): initial \(original), target \(target), down \(start), lifted \(try WindowMetadata.current(item).bounds), updated target \(destination), up \(end)\n",stderr)
-            }
-            let up = try event(.leftMouseUp,end,anchor)
-            try await delivery.send(up,repetitions:2)
-        } catch {
-            for _ in 0..<2 { release.post(tap:.cgSessionEventTap); release.postToPid(hostPID) }
-            throw error
         }
         let deadline = Date().addingTimeInterval(configuration.movementTimeout)
         while Date() < deadline {

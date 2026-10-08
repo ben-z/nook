@@ -90,10 +90,17 @@ public struct Catalog: Sendable {
         struct Owned { let pid:pid_t; let window:CGWindowID }
         var identities = [String:Identity]()
         var owned = [String:Owned]()
+        var previousApplications = Set<pid_t>()
         func bindWindow(_ key:String,pid:pid_t,window:CGWindowID) { owned[key] = Owned(pid:pid,window:window) }
     func inspect(_ applications:[Application],configuration:Configuration) throws -> Catalog {
         var items = [MenuBarItem](); var errors = Set<String>(); var rootErrors = Set<String>(); var observed = [String:Identity]()
-        for application in applications {
+        let currentApplications = Set(applications.map(\.pid))
+        let nativeBefore = Set(try WindowMetadata.statusWindows(configuration).map(\.id))
+        let identifiedBefore = Set(identities.values.map(\.window))
+        let providers = Set(identities.values.map(\.pid))
+        let unchanged = currentApplications == previousApplications && nativeBefore == identifiedBefore
+        let candidates = unchanged ? applications.filter { providers.contains($0.pid) }:applications
+        for application in candidates {
             let identifier = application.identifier; let name = application.name
             var foundBar = false
             do {
@@ -129,7 +136,7 @@ public struct Catalog: Sendable {
                 else { rootErrors.insert(message) }
             }
         }
-        identities = observed
+        identities = observed; previousApplications = currentApplications
         owned = owned.filter { entry in applications.contains { $0.pid == entry.value.pid } }
         let grouped = Dictionary(grouping:items,by:\.key)
         try require(grouped.values.allSatisfy {$0.count == 1}, "Menu-bar identities are ambiguous; management is unsafe")

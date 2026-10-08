@@ -85,7 +85,10 @@ import MenuBarCore
             self.catalog = catalog
             guard let anchor = catalog.items.first(where: {$0.key == "com.apple.controlcenter:com.apple.menuextra.controlcenter"}) else { throw ManagerError("Cannot locate Control Center to position the manager") }
             try await movement.move(controlWindow,sourcePID:getpid(),relativeTo:anchor.window.id,placement:.left)
-            for item in catalog.items where hidden.contains(item.key) { try await hidePermanently(item) }
+            let ordered = catalog.items.filter { $0.sourcePID != getpid() }.sorted { $0.window.bounds.minX < $1.window.bounds.minX }
+            guard let first = ordered.first else { throw ManagerError("No native icons are available to position the hidden group") }
+            try await movement.move(dividerWindow,sourcePID:getpid(),relativeTo:first.window.id,placement:.left)
+            for item in ordered.reversed() where hidden.contains(item.key) { try await hidePermanently(item) }
             try await group.expanded(!hidden.isEmpty); ready = true; button.isEnabled = true; writeDiagnostics()
         } catch {
             busy = true; reconciliation?.cancel(); report(error)

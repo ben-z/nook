@@ -25,7 +25,11 @@ public struct RevealState {
     public mutating func menuClosed(_ element:AXElementIdentity) { menus.remove(element); hideRequested = true }
     public mutating func interfaces(_ count:Int) {
         precondition(count >= 0)
-        if interfaceCount > 0 && count == 0 { hideRequested = true }
+        if interfaceCount > 0 && count == 0 {
+            hideRequested = true
+            // Menu identities can be reused and close notifications can be omitted.
+            menus.removeAll()
+        }
         interfaceCount = count
     }
     public var shouldCheckClosure:Bool { phase == .visible && hideRequested && !pointerDown && !managerMenuOpen && menus.isEmpty }
