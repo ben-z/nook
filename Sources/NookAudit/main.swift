@@ -90,9 +90,7 @@ struct AuditInterference:LocalizedError {
                 else if CommandLine.arguments.contains("--dismiss") {
                     let identifier = try argument("--target")
                     guard let application = NSRunningApplication.runningApplications(withBundleIdentifier:identifier).first else { throw ManagerError("The dismissal target is not running") }
-                    try require(application.activate(options:[]),"Cannot activate the dismissal target")
-                    try await wait("dismissal target activation") { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == identifier }
-                    try await escape(); try await escape()
+                    try await dismiss(application.processIdentifier)
                     completed.append("Dismissed the test interaction")
                 }
                 else if CommandLine.arguments.contains("--restore-order") { try await restoreOrder() }
@@ -288,7 +286,7 @@ struct AuditInterference:LocalizedError {
                 } catch is CancellationError {
                     try require(name == "drag-cancellation","A timeout packet was canceled unexpectedly")
                 } catch let error as ManagerError {
-                    let expected = name == "drag-close" ? "The native drag channel closed during delivery":"The application did not acknowledge the drag packet"
+                    let expected = name == "drag-close" ? "The native drag channel closed during delivery":"macOS did not receive the request to move the icon"
                     try require(name != "drag-cancellation" && error.message == expected,"Unexpected drag failure: \(error.localizedDescription)")
                 }
                 delivery!.close(); delivery = nil
@@ -333,8 +331,7 @@ struct AuditInterference:LocalizedError {
         try await wait("native status-item interface appeared") { try !interfaces().subtracting(before).isEmpty }
         try await Task.sleep(for:.seconds(audit.interactionHold))
         try require(try !interfaces().subtracting(before).isEmpty,"Native activation did not keep its interface open")
-        try require(target.activate(options:[]),"Cannot activate the test target to dismiss its interface")
-        try await escape(); try await escape()
+        try await dismiss(target.processIdentifier)
         try await wait("native interface dismissed") { try interfaces().subtracting(before).isEmpty }
         completed.append("AXPress opened and dismissed the native status-item interface")
     }
@@ -396,6 +393,13 @@ struct AuditInterference:LocalizedError {
 
     func escape() async throws {
         try await key(53,flags:[])
+    }
+
+    func dismiss(_ pid:pid_t) async throws {
+        guard let application = NSRunningApplication(processIdentifier:pid) else { throw ManagerError("The dismissal target exited") }
+        try require(application.activate(options:[]),"Cannot activate the dismissal target")
+        try await wait("dismissal target activation") { NSWorkspace.shared.frontmostApplication?.processIdentifier == pid }
+        try await escape(); try await escape()
     }
 
     func key(_ code:CGKeyCode,flags:CGEventFlags) async throws {
@@ -610,7 +614,7 @@ struct AuditInterference:LocalizedError {
         revealWindow = maccy.window.id
         try await select("Hide \(maccy.name)"); expectedOrder = try await nativeOrder(); try await select("Show \(maccy.name)")
         try await click(maccy.window.id); try await assertHeld()
-        try await escape(); try await assertHidden()
+        try await dismiss(maccy.sourcePID); try await assertHidden()
         try await select("Keep \(maccy.name) visible")
         try require(try WindowMetadata.statusIsVisible(WindowMetadata.current(maccy.window.id).bounds),"Maccy's icon did not remain visible")
         completed.append("Actual Maccy popup and restoration")
@@ -794,7 +798,9 @@ struct AuditInterference:LocalizedError {
             try await select("Show \(target.name)")
             try await click(target.window.id)
             try await wait("native interface opened") { try state()["menus"] as! Int > 0 || state()["interfaces"] as! Int > 0 }
-            try await escape(); try await assertHidden()
+            if target.bundleIdentifier == "org.p0deje.Maccy" { try await dismiss(target.sourcePID) }
+            else { try await escape() }
+            try await assertHidden()
             if cycle == audit.warmupCycles { try sample("warm",0,managerPID) }
             if cycle > audit.warmupCycles && (cycle-audit.warmupCycles).isMultiple(of:audit.interactionSampleEvery) {
                 try sample("load",cycle-audit.warmupCycles,managerPID)

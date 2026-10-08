@@ -24,7 +24,8 @@ public enum Placement { case left, right }
         _ = try await WindowMetadata.settledStatusWindows(configuration)
         try await UserInput.waitUntilIdle(configuration:configuration)
         let window = try WindowMetadata.current(item)
-        let hostPID = sourcePID
+        // The app supplying the icon and the process rendering its window can differ.
+        let rendererPID = window.pid
         let original = window.bounds
         let target = try WindowMetadata.current(anchor).bounds
         let liveIDs = Set(try WindowMetadata.statusWindows(configuration).map(\.id))
@@ -64,17 +65,18 @@ public enum Placement { case left, right }
             sessionSource.setLocalEventsFilterDuringSuppressionState([.permitLocalMouseEvents,.permitLocalKeyboardEvents,.permitSystemDefinedEvents],state:state)
         }
         sessionSource.localEventsSuppressionInterval = 0
-        var start = CGPoint(x:placement == .left ? target.minX:target.maxX,y:target.minY)
-        var end = start
-        if placement == .left {
-            if original.maxX <= target.minX { end.x -= original.width } else { start.x -= 1 }
-        } else {
-            if original.minX <= target.maxX { end.x -= original.width } else { start.x += 1 }
-        }
+        let desktop = try NSScreen.screens.map { screen in
+            guard let display = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { throw ManagerError("A display has no Core Graphics identity") }
+            return CGDisplayBounds(display)
+        }.reduce(CGRect.null) { $0.union($1) }
+        try require(!desktop.isNull,"No connected displays are available")
+        let start = CGPoint(x:desktop.maxX+original.width,y:desktop.maxY+original.height)
+        let end = CGPoint(x:placement == .left ? target.minX:target.maxX,y:target.midY)
         func event(_ type:CGEventType,_ point:CGPoint,_ window:CGWindowID) throws -> CGEvent {
             guard let event = CGEvent(mouseEventSource:source,mouseType:type,mouseCursorPosition:point,mouseButton:.left) else { throw ManagerError("Cannot allocate mouse event") }
             event.flags = type == .leftMouseUp ? []:.maskCommand
             event.setIntegerValueField(.eventSourceUserData,value:Self.eventMarker)
+            event.setIntegerValueField(.eventTargetUnixProcessID,value:Int64(rendererPID))
             event.setIntegerValueField(.mouseEventWindowUnderMousePointer,value:Int64(window))
             event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent,value:Int64(window))
             // macOS routes offscreen status-item drags using this undocumented window field.
@@ -82,8 +84,8 @@ public enum Placement { case left, right }
             return event
         }
         let down = try event(.leftMouseDown,start,item)
-        let release = try event(.leftMouseUp,CGPoint(x:original.midX,y:original.minY),item)
-        let delivery = try DragDelivery(pid:hostPID,configuration:configuration)
+        let release = try event(.leftMouseUp,CGPoint(x:original.midX,y:original.midY),item)
+        let delivery = try DragDelivery(pid:rendererPID,configuration:configuration)
         defer { delivery.close() }
         try await UserInput.waitUntilIdle(configuration:configuration)
         try require(try WindowMetadata.current(item).bounds == original && WindowMetadata.current(anchor).bounds == target,"The menu-bar layout changed before movement; try again")
@@ -102,19 +104,13 @@ public enum Placement { case left, right }
                     try require(Date() < responseDeadline,"The status item did not acknowledge the drag start")
                     try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
                 }
-                let lifted = try WindowMetadata.current(item).bounds.origin
                 if CommandLine.arguments.contains("--trace-movement") {
-                    fputs("Drag \(item): initial \(original), target \(target), down \(start), lifted \(try WindowMetadata.current(item).bounds), updated target \(try WindowMetadata.current(anchor).bounds), up \(end)\n",stderr)
+                    fputs("Drag \(item): initial \(original), target \(target), down \(start), lifted \(try WindowMetadata.current(item).bounds), updated target \(try WindowMetadata.current(anchor).bounds), up \(end), renderer \(rendererPID)\n",stderr)
                 }
                 let up = try event(.leftMouseUp,end,anchor)
                 try await delivery.send(up,repetitions:2)
-                let upDeadline = Date().addingTimeInterval(configuration.dragTimeout)
-                while try WindowMetadata.current(item).bounds.origin == lifted {
-                    try require(Date() < upDeadline,"The status item did not acknowledge the drag end")
-                    try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
-                }
             } catch {
-                for _ in 0..<2 { release.post(tap:.cgSessionEventTap); release.postToPid(hostPID) }
+                for _ in 0..<2 { release.post(tap:.cgSessionEventTap); release.postToPid(rendererPID) }
                 throw error
             }
         }

@@ -12,13 +12,11 @@ import CoreGraphics
     private var ports = [CFMachPort]()
     private var sources = [CFRunLoopSource]()
     private var payload:CGEvent?
-    private var remaining = 0
     private var continuation:CheckedContinuation<Void,Error>?
     private var timeout:Timer?
     private var entry:CGEvent?
-    private var exit:CGEvent?
     private var failure:String?
-    private var disabled = Set<Int>()
+    private var sessionDisabled = false
     private static var signalSequence:UInt32 = 0
 
     public init(pid:pid_t,configuration:Configuration) throws {
@@ -26,7 +24,7 @@ import CoreGraphics
         let mouseMask = [CGEventType.leftMouseDown,.leftMouseUp].reduce(CGEventMask(0)) { $0 | (CGEventMask(1)<<$1.rawValue) }
         let context = Unmanaged.passUnretained(self).toOpaque()
         do {
-            guard let signals = CGEvent.tapCreateForPid(pid:pid,place:.headInsertEventTap,options:.defaultTap,eventsOfInterest:mouseMask | 1,callback:{_,type,event,context in
+            guard let signals = CGEvent.tapCreateForPid(pid:pid,place:.headInsertEventTap,options:.defaultTap,eventsOfInterest:1,callback:{_,type,event,context in
                 let forward = MainActor.assumeIsolated {
                     guard let context else { preconditionFailure("Missing drag delivery context") }
                     return Unmanaged<DragDelivery>.fromOpaque(context).takeUnretainedValue().application(type,event)
@@ -51,7 +49,7 @@ import CoreGraphics
     }
 
     private func check(_ type:CGEventType,channel:Int) {
-        if (type == .tapDisabledByTimeout || type == .tapDisabledByUserInput) && !disabled.contains(channel) {
+        if (type == .tapDisabledByTimeout || type == .tapDisabledByUserInput) && !(channel == 1 && sessionDisabled) {
             let message = "The native drag event channel was disabled (\(channel), \(type.rawValue))"
             failure = message; finish(.failure(ManagerError(message)))
         }
@@ -78,49 +76,47 @@ import CoreGraphics
         check(type,channel:0)
         let marker = event.getIntegerValueField(.eventSourceUserData)
         if type == .null, marker == entry?.getIntegerValueField(.eventSourceUserData), let payload {
-            remaining -= 1; payload.post(tap:.cgSessionEventTap); return false
-        }
-        if type == .null, marker == exit?.getIntegerValueField(.eventSourceUserData), payload != nil { finish(.success(())); return false }
-        if matches(event) {
-            guard let signal = remaining > 0 ? entry:exit else { preconditionFailure("Missing drag packet signal") }
-            signal.postToPid(pid)
+            payload.post(tap:.cgSessionEventTap); return false
         }
         return true
     }
     private func session(_ type:CGEventType,_ event:CGEvent) {
         check(type,channel:1)
-        if matches(event), let payload {
-            if remaining <= 0 { disabled.insert(1); CGEvent.tapEnable(tap:ports[1],enable:false) }
+        if !sessionDisabled, matches(event), let payload {
+            sessionDisabled = true; CGEvent.tapEnable(tap:ports[1],enable:false)
             payload.postToPid(pid)
+            finish(.success(()))
         }
     }
     public func send(_ event:CGEvent,repetitions:Int) async throws {
         try require(payload == nil && repetitions > 0 && ports.count == 2,"Invalid drag delivery transaction")
-        try Task.checkCancellation()
-        if let failure { throw ManagerError(failure) }
-        let entry = try Self.signalEvent(); let exit = try Self.signalEvent()
-        self.entry = entry; self.exit = exit
-        let token = entry.getIntegerValueField(.eventSourceUserData)
-        payload = event; remaining = repetitions
-        disabled.removeAll()
-        CGEvent.tapEnable(tap:ports[1],enable:true)
-        defer { timeout?.invalidate(); timeout = nil; payload = nil; self.entry = nil; self.exit = nil }
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                self.continuation = continuation
-                let timer = Timer(timeInterval:configuration.dragTimeout,repeats:false) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
-                        self.finish(.failure(ManagerError("The application did not acknowledge the drag packet")))
+        for _ in 0..<repetitions {
+            try Task.checkCancellation()
+            if let failure { throw ManagerError(failure) }
+            let entry = try Self.signalEvent()
+            self.entry = entry
+            let token = entry.getIntegerValueField(.eventSourceUserData)
+            payload = event
+            sessionDisabled = false
+            CGEvent.tapEnable(tap:ports[1],enable:true)
+            defer { timeout?.invalidate(); timeout = nil; payload = nil; self.entry = nil }
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.continuation = continuation
+                    let timer = Timer(timeInterval:configuration.dragTimeout,repeats:false) { [weak self] _ in
+                        MainActor.assumeIsolated {
+                            guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
+                            self.finish(.failure(ManagerError("macOS did not receive the request to move the icon")))
+                        }
                     }
+                    timeout = timer; RunLoop.main.add(timer,forMode:.common)
+                    entry.postToPid(pid)
                 }
-                timeout = timer; RunLoop.main.add(timer,forMode:.common)
-                entry.postToPid(pid)
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
-                self.finish(.failure(CancellationError()))
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
+                    self.finish(.failure(CancellationError()))
+                }
             }
         }
     }
@@ -132,7 +128,7 @@ import CoreGraphics
     public func close() {
         guard !ports.isEmpty else { return }
         finish(.failure(ManagerError("The native drag channel closed during delivery")))
-        payload = nil; entry = nil; exit = nil
+        payload = nil; entry = nil
         releasePorts(); Self.liveCount -= 1
     }
     isolated deinit { close() }
