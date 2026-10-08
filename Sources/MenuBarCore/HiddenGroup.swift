@@ -46,21 +46,10 @@ import AppKit
             guard let app = NSRunningApplication(processIdentifier:item.sourcePID) else { return false }
             return !app.isTerminated && app.bundleIdentifier == item.bundleIdentifier
         }
-        do {
-            for item in order.prefix(index+1).reversed() {
-                if !running(item) { continue }
-                do { try await prepend(item.window.id,sourcePID:item.sourcePID) }
-                catch {
-                    if running(item) { throw error }
-                    fputs("The source process \(item.sourcePID) exited during restoration: \(error.localizedDescription)\n",stderr)
-                }
-            }
-            try await expanded(true)
-            let restored = try await windows().map(\.id)
-            try require(restored == order.filter(running).map { $0.window.id },"The hidden group did not regain its original order")
-        } catch {
-            try await expanded(true)
-            throw error
-        }
+        let successor = order.dropFirst(index+1).first(where:running)
+        try await expanded(true)
+        try await movement.move(source.window.id,sourcePID:source.sourcePID,relativeTo:successor?.window.id ?? window,placement:.left)
+        let restored = try await windows().map(\.id)
+        try require(restored == order.filter(running).map { $0.window.id },"The hidden group did not regain its original order")
     }
 }

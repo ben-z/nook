@@ -39,6 +39,14 @@ final class RevealStateTests:XCTestCase {
         XCTAssertTrue(state.shouldCheckClosure); XCTAssertFalse(state.canHide)
         state.interfaces(0); XCTAssertTrue(state.canHide)
     }
+    func testNativeClosureReconcilesMissingMenuClosedNotification() throws {
+        var state = RevealState(); _ = try state.begin(); state.revealed()
+        state.menuOpened(AXElementIdentity(AXUIElementCreateApplication(1)))
+        state.interfaces(2); state.interfaces(1)
+        XCTAssertFalse(state.canHide); XCTAssertEqual(state.menus.count,1)
+        state.interfaces(0)
+        XCTAssertTrue(state.canHide); XCTAssertTrue(state.menus.isEmpty)
+    }
     func testDuplicateOpenNotificationDoesNotRetainMenu() throws {
         var state = RevealState(); _ = try state.begin(); state.revealed()
         let menu = AXElementIdentity(AXUIElementCreateApplication(1))
@@ -67,6 +75,18 @@ final class RevealStateTests:XCTestCase {
         XCTAssertFalse(state.canHide); XCTAssertThrowsError(try state.begin())
         state.finish(); XCTAssertEqual(state.phase,.hidden)
         XCTAssertNoThrow(try state.begin())
+    }
+
+    func testRecoveryIsAnExclusiveCancelableTransition() throws {
+        var state = RevealState(); _ = try state.begin(); state.fail()
+        let token = try state.retryHiding()
+        XCTAssertEqual(state.phase,.hiding)
+        XCTAssertThrowsError(try state.begin())
+        XCTAssertThrowsError(try state.retryHiding())
+        state.cancelTransition()
+        XCTAssertNotEqual(state.generation,token)
+        XCTAssertEqual(state.phase,.stopping)
+        state.finish(); XCTAssertNoThrow(try state.begin())
     }
 
 }

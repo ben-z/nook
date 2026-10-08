@@ -30,6 +30,11 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     return info.ri_phys_footprint
 }
 
+struct AuditInterference:LocalizedError {
+    let message:String
+    var errorDescription:String? { message }
+}
+
 @MainActor final class Audit:NSObject,NSApplicationDelegate {
     let configuration = Configuration()
     var audit = AuditConfiguration()
@@ -41,6 +46,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     var revealWindow:CGWindowID?
     var expectedOrder:[CGWindowID]?
     var inputMonitor:AuditInputMonitor?
+    var expectedFailure:String?
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         Task { @MainActor in
@@ -54,7 +60,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                     guard let every = Int(try argument("--sample-every")),every > 0 else { throw ManagerError("Invalid sampling interval") }
                     audit.sampleEvery = every
                 }
-                if ["--e2e","--sound-e2e","--stress","--space-e2e","--order-e2e","--lifecycle-e2e","--restore-order","--restore","--select"].contains(where:CommandLine.arguments.contains) {
+                if ["--e2e","--sound-e2e","--stress","--space-e2e","--order-e2e","--lifecycle-e2e","--input-e2e","--restore-order","--restore","--select"].contains(where:CommandLine.arguments.contains) {
                     inputMonitor = try AuditInputMonitor()
                 }
                 defer { inputMonitor?.close() }
@@ -68,6 +74,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                 else if CommandLine.arguments.contains("--space-e2e") { try await spaceEndToEnd() }
                 else if CommandLine.arguments.contains("--order-e2e") { try await orderEndToEnd() }
                 else if CommandLine.arguments.contains("--lifecycle-e2e") { try await lifecycleEndToEnd() }
+                else if CommandLine.arguments.contains("--input-e2e") { try await inputEndToEnd() }
                 else if CommandLine.arguments.contains("--press") { try await pressStatusItem() }
                 else if CommandLine.arguments.contains("--press-title") {
                     guard let pid = pid_t(try argument("--pid")) else { throw ManagerError("Invalid process ID") }
@@ -83,16 +90,16 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                 else if CommandLine.arguments.contains("--dismiss") {
                     let identifier = try argument("--target")
                     guard let application = NSRunningApplication.runningApplications(withBundleIdentifier:identifier).first else { throw ManagerError("The dismissal target is not running") }
-                    try require(application.activate(options:[]),"Cannot activate the dismissal target")
-                    try await wait("dismissal target activation") { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == identifier }
-                    try await escape(); try await escape()
+                    try await dismiss(application.processIdentifier)
                     completed.append("Dismissed the test interaction")
                 }
                 else if CommandLine.arguments.contains("--restore-order") { try await restoreOrder() }
                 else if CommandLine.arguments.contains("--restore") {
                     let source = try await item(try argument("--target"))
-                    let anchor = try await item(try argument("--before"))
-                    try await Movement(configuration:configuration).move(source.window.id,sourcePID:source.sourcePID,relativeTo:anchor.window.id,placement:.left)
+                    let before = CommandLine.arguments.contains("--before")
+                    try require(before != CommandLine.arguments.contains("--after"),"Specify exactly one --before or --after destination")
+                    let anchor = try await item(try argument(before ? "--before":"--after"))
+                    try await Movement(configuration:configuration).move(source.window.id,sourcePID:source.sourcePID,relativeTo:anchor.window.id,placement:before ? .left:.right)
                     completed.append("Restored the tested icon's original neighbour")
                 }
                 else if CommandLine.arguments.contains("--inspect") { try await inspect() }
@@ -108,7 +115,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                 fputs("AUDIT FAILED: \(message)\n",stderr)
                 if CommandLine.arguments.contains("--output") {
                     do {
-                        let failure:[String:Any] = ["passed":false,"inconclusive":inputMonitor?.hadInterference == true,"error":message,"completed":completed,"samples":samples]
+                        let failure:[String:Any] = ["passed":false,"inconclusive":error is AuditInterference || inputMonitor?.hadInterference == true,"error":message,"completed":completed,"samples":samples]
                         try JSONSerialization.data(withJSONObject:failure,options:[.prettyPrinted,.sortedKeys]).write(to:URL(fileURLWithPath:try argument("--output")),options:.atomic)
                     } catch { fputs("Cannot save the failed audit: \(error.localizedDescription)\n",stderr); exit(2) }
                 }
@@ -139,9 +146,15 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
             reusedGroup = HiddenGroup(item:reusedItem!,window:window.id,configuration:configuration,movement:Movement(configuration:configuration))
         } else { reusedGroup = nil }
         for cycle in 1...audit.cycles {
+            weak var removedGlobal:TimerFlag?
+            weak var removedLocal:TimerFlag?
             try autoreleasepool {
                 switch name {
-                case "pressed-mouse-buttons": _ = NSEvent.pressedMouseButtons
+                case "pressed-mouse-buttons":
+                    _ = NSEvent.pressedMouseButtons; _ = NSEvent.modifierFlags
+                    for type in [CGEventType.mouseMoved,.scrollWheel,.keyDown,.keyUp,.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp] {
+                        _ = CGEventSource.secondsSinceLastEventType(.combinedSessionState,eventType:type)
+                    }
                 case "window-metadata":
                     let list = try WindowMetadata.statusWindows(configuration)
                     try require(!list.isEmpty,"No status windows")
@@ -166,8 +179,10 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                     delivery = nil
                     try require(weakDelivery == nil && DragDelivery.liveCount == 0,"The drag event channels were retained after teardown")
                 case "mouse-monitors":
-                    guard let global = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{_ in }),
-                          let local = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{$0}) else { throw ManagerError("Cannot create event monitor") }
+                    let globalFlag = TimerFlag(); let localFlag = TimerFlag()
+                    removedGlobal = globalFlag; removedLocal = localFlag
+                    guard let global = NSEvent.addGlobalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{[globalFlag] _ in globalFlag.fired = true }),
+                          let local = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp],handler:{[localFlag] event in localFlag.fired = true; return event}) else { throw ManagerError("Cannot create event monitor") }
                     NSEvent.removeMonitor(global); NSEvent.removeMonitor(local)
                 case "audit-input":
                     var monitor:AuditInputMonitor? = try AuditInputMonitor()
@@ -244,15 +259,41 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
                     defaults.set(["test"],forKey:"hiddenKeys")
                     try require(defaults.array(forKey:"hiddenKeys") as? [String] == ["test"],"Preference round trip failed")
                     defaults.removePersistentDomain(forName:"com.benzhang.nook.memoryaudit")
-                case "timers","catalog","status-resize-settled": break
+                case "timers","catalog","status-resize-settled","drag-timeout","drag-cancellation","drag-close": break
                 default: throw ManagerError("Unknown API group \(name)")
                 }
+            }
+            if name == "mouse-monitors" {
+                try require(removedGlobal == nil && removedLocal == nil,"A removed mouse monitor retained its handler")
             }
             if name == "status-resize-settled" {
                 guard let reusedGroup else { throw ManagerError("Missing reusable status group") }
                 try await reusedGroup.expanded(true); try await reusedGroup.expanded(false)
             }
             if name == "catalog" { _ = try await Catalog.read(configuration) }
+            if ["drag-timeout","drag-cancellation","drag-close"].contains(name) {
+                var delivery:DragDelivery? = try DragDelivery(pid:target.processIdentifier,configuration:configuration)
+                weak let weakDelivery = delivery
+                guard let event = CGEvent(source:nil) else { throw ManagerError("Cannot allocate the test packet") }
+                // A null payload cannot reach the mouse receipt channel and changes no input state.
+                let sender = Task { @MainActor [delivery = delivery!] in try await delivery.send(event) }
+                if name == "drag-cancellation" || name == "drag-close" {
+                    try await Task.sleep(for:.seconds(audit.checkInterval))
+                    if name == "drag-cancellation" { sender.cancel() }
+                    else { delivery!.close() }
+                }
+                do {
+                    try await sender.value
+                    throw ManagerError("The deliberately unacknowledged packet unexpectedly succeeded")
+                } catch is CancellationError {
+                    try require(name == "drag-cancellation","A timeout packet was canceled unexpectedly")
+                } catch let error as ManagerError {
+                    let expected = name == "drag-close" ? "The native drag channel closed during delivery":"macOS did not receive the request to move the icon"
+                    try require(name != "drag-cancellation" && error.message == expected,"Unexpected drag failure: \(error.localizedDescription)")
+                }
+                delivery!.close(); delivery = nil
+                try require(weakDelivery == nil && DragDelivery.liveCount == 0,"Drag delivery remained alive after the pending packet ended")
+            }
             if name == "timers" {
                 let flag = TimerFlag()
                 let timer = Timer(timeInterval:audit.timerInterval,repeats:false) { [weak flag] _ in MainActor.assumeIsolated { flag?.fired = true } }
@@ -266,6 +307,10 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
             }
         }
         try await Task.sleep(for:.seconds(configuration.gracePeriod))
+        if CommandLine.arguments.contains("--hold-for-leaks") {
+            guard let seconds = TimeInterval(try argument("--hold-for-leaks")),seconds > 0 else { throw ManagerError("Invalid heap-scan hold interval") }
+            try await Task.sleep(for:.seconds(seconds))
+        }
         try sample("settled",audit.cycles,getpid())
         completed.append("\(name): \(audit.cycles) cycles")
     }
@@ -288,8 +333,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         try await wait("native status-item interface appeared") { try !interfaces().subtracting(before).isEmpty }
         try await Task.sleep(for:.seconds(audit.interactionHold))
         try require(try !interfaces().subtracting(before).isEmpty,"Native activation did not keep its interface open")
-        try require(target.activate(options:[]),"Cannot activate the test target to dismiss its interface")
-        try await escape(); try await escape()
+        try await dismiss(target.processIdentifier)
         try await wait("native interface dismissed") { try interfaces().subtracting(before).isEmpty }
         completed.append("AXPress opened and dismissed the native status-item interface")
     }
@@ -315,8 +359,8 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         try inputMonitor?.check()
         guard let diagnostics else { throw ManagerError("Missing diagnostics path") }
         guard let value = try JSONSerialization.jsonObject(with:Data(contentsOf:diagnostics)) as? [String:Any] else { throw ManagerError("Invalid diagnostics") }
-        if let error = value["error"] as? String { throw ManagerError(error) }
-        if let error = value["failure"] as? String { throw ManagerError(error) }
+        if let error = value["error"] as? String, error != expectedFailure { throw ManagerError(error) }
+        if let error = value["failure"] as? String, error != expectedFailure { throw ManagerError(error) }
         try require(value["pid"] as? pid_t == managerPID,"Diagnostics belong to another process")
         return value
     }
@@ -333,6 +377,11 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
 
     func click(_ id:CGWindowID) async throws {
         let frame = try WindowMetadata.current(id).bounds
+        try await click(frame)
+    }
+
+    func click(_ frame:CGRect) async throws {
+        try require(frame.width > 0 && frame.height > 0,"The test click target has no visible bounds")
         let point = CGPoint(x:frame.midX,y:frame.midY)
         guard let down = CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:point,mouseButton:.left),
               let up = CGEvent(mouseEventSource:nil,mouseType:.leftMouseUp,mouseCursorPosition:point,mouseButton:.left) else { throw ManagerError("Cannot create test click") }
@@ -346,6 +395,13 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
 
     func escape() async throws {
         try await key(53,flags:[])
+    }
+
+    func dismiss(_ pid:pid_t) async throws {
+        guard let application = NSRunningApplication(processIdentifier:pid) else { throw ManagerError("The dismissal target exited") }
+        try require(application.activate(options:[]),"Cannot activate the dismissal target")
+        try await wait("dismissal target activation") { NSWorkspace.shared.frontmostApplication?.processIdentifier == pid }
+        try await escape(); try await escape()
     }
 
     func key(_ code:CGKeyCode,flags:CGEventFlags) async throws {
@@ -377,8 +433,17 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         guard let completed = try state()["completedActions"] as? UInt64 else { throw ManagerError("No completed action counter") }
         guard let control = try state()["controlWindow"] as? UInt32 else { throw ManagerError("No control window") }
         try await click(control)
+        try await wait("manager menu presentation") { try state()["menuPresented"] as? Bool == true }
+        if title.hasPrefix("Hide ") && !title.hasSuffix(" now") || title.hasPrefix("Keep ") {
+            let manage = try await row(pid:managerPID,title:"Manage icons")
+            try Accessibility.check(AXUIElementPerformAction(manage,kAXPressAction as CFString),"Open Manage icons")
+        }
         let element = try await row(pid:managerPID,title:title)
         try Accessibility.check(AXUIElementPerformAction(element,kAXPressAction as CFString),"Select \(title)")
+        if title == "Quit Nook" {
+            try await wait("manager quit") { NSRunningApplication(processIdentifier:managerPID)?.isTerminated != false }
+            return
+        }
         try await wait("menu selection completed") { try state()["completedActions"] as! UInt64 > completed && state()["busy"] as? Bool == false && state()["managerMenuOpen"] as? Bool == false }
     }
 
@@ -429,6 +494,16 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
             guard let key = entry["key"] as? String, let pid = entry["pid"] as? pid_t, let window = entry["window"] as? CGWindowID else { throw ManagerError("Invalid native item identity") }
             await Catalog.bindWindow(key,pid:pid,window:window)
         }
+        let value = try state()
+        guard let hidden = value["hidden"] as? [String],let divider = value["dividerWindow"] as? CGWindowID else { throw ManagerError("Missing hidden-group configuration") }
+        let boundary = try WindowMetadata.current(divider).bounds.minX
+        for entry in identities {
+            let pid = entry["pid"] as! pid_t
+            if pid == managerPID { continue }
+            let key = entry["key"] as! String
+            let bounds = try WindowMetadata.current(entry["window"] as! CGWindowID).bounds
+            try require((bounds.maxX <= boundary+configuration.geometryTolerance) == hidden.contains(key),"The hidden group does not match the selected icons: \(key)")
+        }
     }
 
     func endToEnd() async throws {
@@ -459,7 +534,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
             try await select("Show \(name)")
             try await click(fixture.window.id)
             let menuItem = try await row(pid:fixturePID,title:title)
-            try Accessibility.check(AXUIElementPerformAction(menuItem,kAXPressAction as CFString),title)
+            try await click(Accessibility.bounds(menuItem))
             let close = try await row(pid:fixturePID,title:button)
             try await assertHeld()
             try Accessibility.check(AXUIElementPerformAction(close,kAXPressAction as CFString),button)
@@ -467,7 +542,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         }
         try await select("Show \(name)")
         try await click(fixture.window.id)
-        try await wait("menu opened") { try state()["menus"] as! Int > 0 }
+        try await wait("menu opened") { try state()["interfaces"] as! Int > 0 }
         try await escape()
         try await wait("native menu closed before reopening") {
             try state()["menus"] as? Int == 0 && WindowMetadata.list(.optionOnScreenOnly,relativeTo:0).allSatisfy {
@@ -475,7 +550,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
             }
         }
         try await click(fixture.window.id)
-        try await wait("native menu reopened before restoration") { try state()["menus"] as! Int > 0 }
+        try await wait("native menu reopened before restoration") { try state()["interfaces"] as! Int > 0 }
         try await assertHeld(); try await escape(); try await assertHidden()
         completed.append("Reopening cancels an older pending hide")
 
@@ -515,8 +590,22 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         completed.append("Automatic hiding waits until every pressed mouse button is released")
 
         try await select("Show \(name)")
+        try await select("Hide \(name) now")
+        guard let pointer = CGEvent(source:nil)?.location else { throw ManagerError("Cannot read the test pointer") }
+        let motionDeadline = Date().addingTimeInterval(audit.interactionHold)
+        while Date() < motionDeadline {
+            guard let motion = CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:pointer,mouseButton:.left) else { throw ManagerError("Cannot allocate the motion test") }
+            motion.setIntegerValueField(.eventSourceUserData,value:Movement.eventMarker)
+            motion.post(tap:.cghidEventTap)
+            try await Task.sleep(for:.seconds(audit.checkInterval))
+            try require(try state()["phase"] as? String == "visible","Icon hid during continuous pointer motion")
+        }
+        try await assertHidden()
+        completed.append("Pending automatic hiding waits for pointer motion to stop")
+
+        try await select("Show \(name)")
         try await key(CGKeyCode(configuration.hotKeyCode),flags:[.maskControl,.maskAlternate])
-        try await wait("keyboard shortcut opened the manager") { try state()["managerMenuOpen"] as? Bool == true }
+        try await wait("keyboard shortcut opened the manager") { try state()["menuPresented"] as? Bool == true }
         try await Task.sleep(for:.seconds(audit.interactionHold))
         try require(try state()["phase"] as? String == "visible","Icon hid while the manager menu was open")
         let hideNow = try await row(pid:managerPID,title:"Hide \(name) now")
@@ -532,7 +621,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         revealWindow = maccy.window.id
         try await select("Hide \(maccy.name)"); expectedOrder = try await nativeOrder(); try await select("Show \(maccy.name)")
         try await click(maccy.window.id); try await assertHeld()
-        try await escape(); try await assertHidden()
+        try await dismiss(maccy.sourcePID); try await assertHidden()
         try await select("Keep \(maccy.name) visible")
         try require(try WindowMetadata.statusIsVisible(WindowMetadata.current(maccy.window.id).bounds),"Maccy's icon did not remain visible")
         completed.append("Actual Maccy popup and restoration")
@@ -666,6 +755,36 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
         print("FIXTURE TERMINATED \(relaunched.processIdentifier)")
     }
 
+    func inputEndToEnd() async throws {
+        try await connectManager()
+        let fixture = try await item("com.benzhang.nook.fixture")
+        if !(try state()["hidden"] as! [String]).contains(fixture.key) { try await select("Hide \(fixture.name)") }
+        revealWindow = fixture.window.id; expectedOrder = try await nativeOrder()
+        audit.timeout = configuration.inputWaitTimeout + audit.timeout
+        expectedFailure = "Pause mouse and keyboard input briefly so Nook can move the icon"
+        let motion = Task { @MainActor in
+            while !Task.isCancelled {
+                guard let pointer = CGEvent(source:nil)?.location,
+                      let event = CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:pointer,mouseButton:.left) else { throw ManagerError("Cannot allocate active-input test event") }
+                event.setIntegerValueField(.eventSourceUserData,value:Movement.eventMarker)
+                event.post(tap:.cghidEventTap)
+                do { try await Task.sleep(for:.seconds(configuration.movementCheckInterval)) }
+                catch is CancellationError { return }
+            }
+        }
+        defer { motion.cancel(); expectedFailure = nil }
+        try await select("Show \(fixture.name)")
+        let failed = try state()
+        try require(failed["phase"] as? String == "failed" && failed["error"] as? String == expectedFailure,"Continuous input did not produce the expected movement timeout")
+        try require(failed["resources"] as? Int == 0 && failed["dragChannels"] as? Int == 0 && failed["observers"] as? Int == 0,"The failed reveal retained its interaction resources")
+        try require(try await nativeOrder() == expectedOrder,"An input timeout changed native icon order")
+        motion.cancel(); try await motion.value
+        try await select("Retry hiding the icon")
+        try await assertHidden()
+        try require(try state()["error"] == nil && state()["failure"] == nil,"Recovery retained a stale error")
+        completed.append("Continuous input leaves icon order untouched, releases reveal resources, and offers a working restoration retry")
+    }
+
     func stress() async throws {
         try await connectManager()
         guard let managerPID else { throw ManagerError("Test processes were not connected") }
@@ -686,7 +805,9 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
             try await select("Show \(target.name)")
             try await click(target.window.id)
             try await wait("native interface opened") { try state()["menus"] as! Int > 0 || state()["interfaces"] as! Int > 0 }
-            try await escape(); try await assertHidden()
+            if target.bundleIdentifier == "org.p0deje.Maccy" { try await dismiss(target.sourcePID) }
+            else { try await escape() }
+            try await assertHidden()
             if cycle == audit.warmupCycles { try sample("warm",0,managerPID) }
             if cycle > audit.warmupCycles && (cycle-audit.warmupCycles).isMultiple(of:audit.interactionSampleEvery) {
                 try sample("load",cycle-audit.warmupCycles,managerPID)
@@ -708,6 +829,7 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     var hadInterference:Bool { interference != nil }
 
     init() throws {
+        try check()
         let mask:NSEvent.EventTypeMask = [.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.keyDown,.keyUp,.scrollWheel]
         global = NSEvent.addGlobalMonitorForEvents(matching:mask) { [weak self] in self?.observe($0) }
         guard global != nil else { throw ManagerError("Cannot monitor external input during the GUI audit") }
@@ -727,7 +849,16 @@ func footprint(_ pid:pid_t) throws -> UInt64 {
     }
 
     func check() throws {
-        if let interference { throw ManagerError(interference) }
+        guard let session = CGSessionCopyCurrentDictionary() as? [String:Any] else {
+            throw ManagerError("Cannot read the graphical login session")
+        }
+        try require(session["kCGSSessionOnConsoleKey"] as? Bool == true && session["kCGSessionLoginDoneKey"] as? Bool == true,
+                    "GUI audits require a logged-in console session")
+        if let value = session["CGSSessionScreenIsLocked"] {
+            guard let locked = value as? Bool else { throw ManagerError("The graphical session's lock state has an invalid type") }
+            if locked { interference = "The Mac is locked. Unlock it before running GUI audits; this run is inconclusive" }
+        }
+        if let interference { throw AuditInterference(message:interference) }
     }
 
     func close() {

@@ -7,6 +7,7 @@ import MenuBarCore
 @MainActor final class Manager: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let configuration = Configuration()
     let menu = NSMenu(title:"Nook")
+    let manageMenu = NSMenu(title:"Manage icons")
     lazy var movement = Movement(configuration:configuration)
     var control: NSStatusItem!
     var divider: NSStatusItem!
@@ -18,7 +19,9 @@ import MenuBarCore
     var catalog: Catalog?
     var failure: String?
     var menuLoading = false
+    var menuPresented = false
     var busy = false
+    var ready = false
     var completedActions:UInt64 = 0
     var hotKey: EventHotKeyRef?
     var hotKeyHandler: EventHandlerRef?
@@ -49,6 +52,7 @@ import MenuBarCore
             button.toolTip = "Nook (Control–Option–M)"
             button.setAccessibilityIdentifier("Nook.Control")
             button.target = self; button.action = #selector(showMenu)
+            button.isEnabled = false
             divider = NSStatusBar.system.statusItem(withLength:configuration.dividerWidth)
             divider.autosaveName = "Nook.Divider"
             divider.button!.title = "│"
@@ -71,26 +75,29 @@ import MenuBarCore
             }
             busy = true
             defer { busy = false; writeDiagnostics(); reconcileApplications() }
-            do {
-                try await Task.sleep(for:.seconds(configuration.gracePeriod))
-                controlWindow = try await WindowMetadata.owned(identifier:"Nook.Control",configuration:configuration,excluding:previousWindows).id
-                dividerWindow = try await WindowMetadata.owned(identifier:"Nook.Divider",configuration:configuration,excluding:previousWindows).id
-                await Catalog.bindWindow("com.benzhang.nook:Nook.Control",pid:getpid(),window:controlWindow)
-                await Catalog.bindWindow("com.benzhang.nook:Nook.Divider",pid:getpid(),window:dividerWindow)
-                group = HiddenGroup(item:divider,window:dividerWindow,configuration:configuration,movement:movement)
-                reveal = RevealController(configuration:configuration,movement:movement,control:controlWindow,group:group)
-                reveal.changed = { [weak self] in self?.writeDiagnostics(); self?.reconcileApplications() }
-                let catalog = try await Catalog.read(configuration)
-                self.catalog = catalog
-                guard let anchor = catalog.items.first(where: {$0.key == "com.apple.controlcenter:com.apple.menuextra.controlcenter"}) else { throw ManagerError("Cannot locate Control Center to position the manager") }
-                try await movement.move(controlWindow,sourcePID:getpid(),relativeTo:anchor.window.id,placement:.left)
-                for item in catalog.items where hidden.contains(item.key) { try await hidePermanently(item) }
-                try await group.expanded(!hidden.isEmpty); button.isEnabled = true; writeDiagnostics()
-            } catch { report(error) }
+            try await Task.sleep(for:.seconds(configuration.gracePeriod))
+            controlWindow = try await WindowMetadata.owned(identifier:"Nook.Control",configuration:configuration,excluding:previousWindows).id
+            dividerWindow = try await WindowMetadata.owned(identifier:"Nook.Divider",configuration:configuration,excluding:previousWindows).id
+            await Catalog.bindWindow("com.benzhang.nook:Nook.Control",pid:getpid(),window:controlWindow)
+            await Catalog.bindWindow("com.benzhang.nook:Nook.Divider",pid:getpid(),window:dividerWindow)
+            group = HiddenGroup(item:divider,window:dividerWindow,configuration:configuration,movement:movement)
+            reveal = RevealController(configuration:configuration,movement:movement,control:controlWindow,group:group)
+            reveal.changed = { [weak self] in self?.updateControl(); self?.writeDiagnostics(); self?.reconcileApplications() }
+            let catalog = try await Catalog.read(configuration)
+            self.catalog = catalog
+            guard let anchor = catalog.items.first(where: {$0.key == "com.apple.controlcenter:com.apple.menuextra.controlcenter"}) else { throw ManagerError("Cannot locate Control Center to position the manager") }
+            try await movement.move(controlWindow,sourcePID:getpid(),relativeTo:anchor.window.id,placement:.left)
+            let ordered = catalog.items.filter { $0.sourcePID != getpid() }.sorted { $0.window.bounds.minX < $1.window.bounds.minX }
+            guard let first = ordered.first else { throw ManagerError("No native icons are available to position the hidden group") }
+            try await movement.move(dividerWindow,sourcePID:getpid(),relativeTo:first.window.id,placement:.left)
+            for item in ordered.reversed() where hidden.contains(item.key) { try await hidePermanently(item) }
+            try await group.expanded(!hidden.isEmpty); ready = true; button.isEnabled = true; writeDiagnostics()
         } catch {
+            busy = true; reconciliation?.cancel(); report(error)
             let alert = NSAlert(); alert.messageText = "Nook cannot start"; alert.informativeText = error.localizedDescription
-            alert.addButton(withTitle:"Open Accessibility Settings"); alert.addButton(withTitle:"Quit")
-            if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
+            alert.addButton(withTitle:"Quit")
+            if !AXIsProcessTrusted() { alert.addButton(withTitle:"Open Accessibility Settings") }
+            if alert.runModal() == .alertSecondButtonReturn { NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
             NSApp.terminate(nil)
         }
         }
@@ -109,11 +116,12 @@ import MenuBarCore
     }
 
     @objc func showMenu() {
-        guard !menuLoading, !busy, let reveal, ![.revealing,.hiding,.stopping].contains(reveal.state.phase) else { return }
+        guard ready, !menuLoading, !busy, let reveal, ![.revealing,.hiding,.stopping].contains(reveal.state.phase) else { return }
         menuLoading = true
         reveal.managerMenu(true)
         Task { @MainActor in
-        defer { menuLoading = false; reveal.managerMenu(false); reconcileApplications() }
+        control.button?.appearsDisabled = true
+        defer { control.button?.appearsDisabled = false; menuLoading = false; reveal.managerMenu(false); reconcileApplications() }
         do {
             try Accessibility.configure(configuration)
             let catalog = try await Catalog.read(configuration)
@@ -121,28 +129,50 @@ import MenuBarCore
             menu.removeAllItems()
             menu.delegate = self
             menu.autoenablesItems = false
-            if let error = reveal.error { add(error,to:menu,enabled:false) }
-            if let failure { add(failure,to:menu,enabled:false) }
+            if reveal.error != nil || failure != nil {
+                add("The last action could not finish",to:menu,enabled:false)
+                let details = add("Show error details…",to:menu,enabled:true)
+                details.target = self; details.action = #selector(showFailure)
+                if reveal.canRetryHiding {
+                    let retry = add("Retry hiding the icon",to:menu,enabled:true)
+                    retry.target = self; retry.action = #selector(retryHiding)
+                } else if reveal.state.phase == .failed {
+                    add("Quit Nook to show all icons",to:menu,enabled:false)
+                }
+                menu.addItem(.separator())
+            }
             if let item = reveal.item {
                 let hide = add("Hide \(item.name) now",to:menu,enabled:reveal.state.phase == .visible)
                 hide.target = self; hide.action = #selector(hideRevealed)
                 menu.addItem(.separator())
             }
-            for item in catalog.items {
-                if item.sourcePID == getpid() { continue }
-                if ["com.apple.controlcenter:com.apple.menuextra.clock","com.apple.controlcenter:com.apple.menuextra.controlcenter"].contains(item.key) { continue }
-                let isHidden = hidden.contains(item.key)
-                let row = add("\(isHidden ? "Show" : "Hide") \(item.name)",to:menu,enabled:!busy && reveal.state.phase == .hidden)
+            let items = catalog.items.filter {
+                $0.sourcePID != getpid() && !["com.apple.controlcenter:com.apple.menuextra.clock","com.apple.controlcenter:com.apple.menuextra.controlcenter"].contains($0.key)
+            }
+            let hiddenItems = items.filter { hidden.contains($0.key) }
+            add(hiddenItems.isEmpty ? "Choose icons in Manage icons" : "Hidden icons",to:menu,enabled:false)
+            for item in hiddenItems {
+                let row = add("Show \(item.name)",to:menu,enabled:reveal.state.phase == .hidden)
                 row.representedObject = item.key; row.target = self; row.action = #selector(selectItem(_:))
-                if isHidden {
-                    let keep = add("Keep \(item.name) visible",to:menu,enabled:!busy && reveal.state.phase == .hidden)
-                    keep.indentationLevel = 1; keep.representedObject = item.key
-                    keep.target = self; keep.action = #selector(keepVisible(_:))
+            }
+            menu.addItem(.separator())
+            let manage = add("Manage icons",to:menu,enabled:reveal.state.phase == .hidden)
+            let settings = manageMenu; settings.removeAllItems(); settings.autoenablesItems = false
+            manage.submenu = settings
+            for isHidden in [true,false] {
+                let group = items.filter { hidden.contains($0.key) == isHidden }
+                if group.isEmpty { continue }
+                if settings.numberOfItems > 0 { settings.addItem(.separator()) }
+                add(isHidden ? "Hidden icons" : "Visible icons",to:settings,enabled:false)
+                for item in group {
+                    let row = add(isHidden ? "Keep \(item.name) visible" : "Hide \(item.name)",to:settings,enabled:true)
+                    row.representedObject = item.key; row.target = self
+                    row.action = isHidden ? #selector(keepVisible(_:)) : #selector(selectItem(_:))
                 }
             }
             if !catalog.inspectionErrors.isEmpty {
                 menu.addItem(.separator())
-                let row = add("Some apps could not be inspected…",to:menu,enabled:true)
+                let row = add("Some icons are unavailable…",to:menu,enabled:true)
                 row.target = self; row.action = #selector(showInspectionErrors)
             }
             menu.addItem(.separator())
@@ -153,7 +183,17 @@ import MenuBarCore
             quit.target = self; quit.action = #selector(quitManager)
             guard let button = control.button else { throw ManagerError("The menu-bar control is unavailable") }
             menu.popUp(positioning:nil,at:NSPoint(x:button.bounds.minX,y:button.bounds.minY),in:button)
-        } catch { report(error) }
+        } catch {
+            report(error)
+            menu.removeAllItems(); menu.delegate = self; menu.autoenablesItems = false
+            add("Menu-bar icons could not be read",to:menu,enabled:false)
+            let details = add("Show error details…",to:menu,enabled:true)
+            details.target = self; details.action = #selector(showFailure)
+            let quit = add("Quit Nook",to:menu,enabled:true)
+            quit.target = self; quit.action = #selector(quitManager)
+            guard let button = control.button else { preconditionFailure("The menu-bar control is unavailable") }
+            menu.popUp(positioning:nil,at:NSPoint(x:button.bounds.minX,y:button.bounds.minY),in:button)
+        }
     }
 
     }
@@ -168,10 +208,11 @@ import MenuBarCore
         busy = true
         writeDiagnostics()
         Task { @MainActor in
-            defer { busy = false; completedActions += 1; writeDiagnostics(); reconcileApplications() }
+            defer { busy = false; completedActions += 1; updateControl(); writeDiagnostics(); reconcileApplications() }
             do {
                 if hidden.contains(key) { try await reveal.reveal(item) }
                 else { try await hidePermanently(item) }
+                failure = nil
             } catch { report(error) }
         }
     }
@@ -196,7 +237,7 @@ import MenuBarCore
         busy = true
         writeDiagnostics()
         Task { @MainActor in
-            defer { busy = false; completedActions += 1; writeDiagnostics(); reconcileApplications() }
+            defer { busy = false; completedActions += 1; updateControl(); writeDiagnostics(); reconcileApplications() }
             do {
                 try await movement.move(item.window.id,sourcePID:item.sourcePID,relativeTo:controlWindow,placement:.right)
                 hidden.remove(key); UserDefaults.standard.set(hidden.sorted(),forKey:"hiddenKeys")
@@ -229,8 +270,8 @@ import MenuBarCore
     }
 
     @objc private func hideRevealed() { reveal.requestHide(); completedActions += 1; writeDiagnostics() }
-    func menuWillOpen(_ menu:NSMenu) { reveal.managerMenu(true) }
-    func menuDidClose(_ menu:NSMenu) { reveal.managerMenu(false); reconcileApplications() }
+    func menuWillOpen(_ menu:NSMenu) { menuPresented = true; reveal.managerMenu(true) }
+    func menuDidClose(_ menu:NSMenu) { menuPresented = false; reveal.managerMenu(false); reconcileApplications() }
     @objc private func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -239,19 +280,42 @@ import MenuBarCore
     }
     @objc private func showInspectionErrors() {
         guard let catalog else { report(ManagerError("No catalog available")); return }
-        let alert = NSAlert(); alert.messageText = "Some apps could not be inspected"; alert.informativeText = catalog.inspectionErrors.joined(separator:"\n"); alert.runModal()
+        let alert = NSAlert(); alert.messageText = "Some menu-bar icons are unavailable"
+        alert.informativeText = "Nook could not identify every native icon. Those icons cannot be managed safely.\n\n" + catalog.inspectionErrors.joined(separator:"\n")
+        alert.runModal()
+    }
+
+    @objc private func showFailure() {
+        guard let message = reveal.error ?? failure else { return }
+        let alert = NSAlert(); alert.messageText = "Nook could not finish the action"
+        alert.informativeText = message; alert.runModal()
+    }
+
+    @objc private func retryHiding() {
+        busy = true; writeDiagnostics()
+        Task { @MainActor in
+            defer { busy = false; completedActions += 1; writeDiagnostics(); reconcileApplications() }
+            do { try await reveal.retryHiding(); failure = nil; updateControl() }
+            catch { report(error) }
+        }
+    }
+
+    private func updateControl() {
+        let failed = failure != nil || reveal?.error != nil
+        control?.button?.image = NSImage(systemSymbolName:failed ? "exclamationmark.circle" : "line.3.horizontal.decrease",accessibilityDescription:"Nook")
+        control?.button?.toolTip = failed ? "Nook: an action failed. Open the menu for details." : "Nook (Control–Option–M)"
     }
 
     private func report(_ error:Error) {
         failure = error.localizedDescription; writeDiagnostics()
         fputs("Nook: \(error.localizedDescription)\n",stderr)
-        let alert = NSAlert(); alert.messageText = "Nook"; alert.informativeText = error.localizedDescription; alert.runModal()
+        updateControl()
     }
 
     func writeDiagnostics() {
         guard let diagnosticsURL else { return }
         do {
-            var value:[String:Any] = ["pid":getpid(),"phase":"starting","busy":busy]
+            var value:[String:Any] = ["pid":getpid(),"phase":"starting","busy":busy,"menuPresented":menuPresented]
             if let reveal {
                 value.merge(["phase":reveal.state.phase.rawValue,"generation":reveal.state.generation,
                 "resources":reveal.resourceCount,"observers":InteractionObserver.liveCount,"dragChannels":DragDelivery.liveCount,

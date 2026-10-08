@@ -28,8 +28,9 @@ import ApplicationServices
     private func transientWindows() throws -> Set<CGWindowID> {
         guard let item else { throw ManagerError("No revealed item") }
         return Set(try WindowMetadata.list(.optionOnScreenOnly,relativeTo:0).filter { window in
-            window.pid == item.sourcePID && window.bounds.height > configuration.maximumStatusWindowHeight &&
-            (window.layer > Int(CGWindowLevelForKey(.normalWindow)) || !baselineWindows.contains(window.id))
+            window.pid == item.sourcePID && window.bounds.height > 0 &&
+            ((window.layer > Int(CGWindowLevelForKey(.normalWindow)) && window.layer != Int(CGWindowLevelForKey(.statusWindow))) ||
+             (window.bounds.height > configuration.maximumStatusWindowHeight && !baselineWindows.contains(window.id)))
         }.map(\.id))
     }
 
@@ -161,7 +162,8 @@ import ApplicationServices
         guard token == state.generation, state.phase == .visible else { return }
         try refreshInterfaces()
         changed?()
-        if !state.canHide { return }
+        if !state.canHide { armTimer(); return }
+        if !UserInput.isIdle(for:configuration.restorationQuietPeriod) { armTimer(); return }
         try state.hiding(token); changed?()
         guard let item else { throw ManagerError("Missing restoration information") }
         try await group.restore(item,order:hiddenOrder)
@@ -171,7 +173,6 @@ import ApplicationServices
 
     private func closeResources() {
         cancelTimer()
-        baselineWindows.removeAll()
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor); self.globalMonitor = nil }
         if let localMonitor { NSEvent.removeMonitor(localMonitor); self.localMonitor = nil }
         if let workspaceMonitor { NSWorkspace.shared.notificationCenter.removeObserver(workspaceMonitor); self.workspaceMonitor = nil }
@@ -199,8 +200,30 @@ import ApplicationServices
     }
 
     public func stop() {
-        closeResources(); item = nil; hiddenOrder.removeAll(); error = nil
+        closeResources(); item = nil; hiddenOrder.removeAll(); baselineWindows.removeAll(); error = nil
         state.finish()
+    }
+
+    public var canRetryHiding:Bool {
+        guard state.phase == .failed, let item else { return false }
+        return hiddenOrder.contains(where: { $0.key == item.key })
+    }
+
+    public func retryHiding() async throws {
+        try require(state.phase == .failed,"No failed reveal needs restoration")
+        guard let item, hiddenOrder.contains(where: { $0.key == item.key }) else {
+            throw ManagerError("The icon's original position is unavailable. Quit Nook to show the hidden group.")
+        }
+        try require(try transientWindows().isEmpty,"Close the application's menus, popovers and windows before retrying")
+        let token = try state.retryHiding(); changed?()
+        do {
+            try await group.restore(item,order:hiddenOrder)
+            guard state.generation == token else { finishCancellation(); return }
+            stop(); changed?()
+        } catch {
+            guard state.generation == token else { finishCancellation(); return }
+            fail(error); throw error
+        }
     }
 
     isolated deinit { closeResources() }
