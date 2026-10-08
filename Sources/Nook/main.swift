@@ -18,6 +18,7 @@ import MenuBarCore
     var catalog: Catalog?
     var failure: String?
     var menuLoading = false
+    var menuPresented = false
     var busy = false
     var ready = false
     var completedActions:UInt64 = 0
@@ -268,8 +269,8 @@ import MenuBarCore
     }
 
     @objc private func hideRevealed() { reveal.requestHide(); completedActions += 1; writeDiagnostics() }
-    func menuWillOpen(_ menu:NSMenu) { reveal.managerMenu(true) }
-    func menuDidClose(_ menu:NSMenu) { reveal.managerMenu(false); reconcileApplications() }
+    func menuWillOpen(_ menu:NSMenu) { menuPresented = true; reveal.managerMenu(true) }
+    func menuDidClose(_ menu:NSMenu) { menuPresented = false; reveal.managerMenu(false); reconcileApplications() }
     @objc private func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -313,7 +314,7 @@ import MenuBarCore
     func writeDiagnostics() {
         guard let diagnosticsURL else { return }
         do {
-            var value:[String:Any] = ["pid":getpid(),"phase":"starting","busy":busy]
+            var value:[String:Any] = ["pid":getpid(),"phase":"starting","busy":busy,"menuPresented":menuPresented]
             if let reveal {
                 value.merge(["phase":reveal.state.phase.rawValue,"generation":reveal.state.generation,
                 "resources":reveal.resourceCount,"observers":InteractionObserver.liveCount,"dragChannels":DragDelivery.liveCount,

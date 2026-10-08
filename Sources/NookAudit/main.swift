@@ -96,8 +96,10 @@ struct AuditInterference:LocalizedError {
                 else if CommandLine.arguments.contains("--restore-order") { try await restoreOrder() }
                 else if CommandLine.arguments.contains("--restore") {
                     let source = try await item(try argument("--target"))
-                    let anchor = try await item(try argument("--before"))
-                    try await Movement(configuration:configuration).move(source.window.id,sourcePID:source.sourcePID,relativeTo:anchor.window.id,placement:.left)
+                    let before = CommandLine.arguments.contains("--before")
+                    try require(before != CommandLine.arguments.contains("--after"),"Specify exactly one --before or --after destination")
+                    let anchor = try await item(try argument(before ? "--before":"--after"))
+                    try await Movement(configuration:configuration).move(source.window.id,sourcePID:source.sourcePID,relativeTo:anchor.window.id,placement:before ? .left:.right)
                     completed.append("Restored the tested icon's original neighbour")
                 }
                 else if CommandLine.arguments.contains("--inspect") { try await inspect() }
@@ -274,7 +276,7 @@ struct AuditInterference:LocalizedError {
                 weak let weakDelivery = delivery
                 guard let event = CGEvent(source:nil) else { throw ManagerError("Cannot allocate the test packet") }
                 // A null payload cannot reach the mouse receipt channel and changes no input state.
-                let sender = Task { @MainActor [delivery = delivery!] in try await delivery.send(event,repetitions:1) }
+                let sender = Task { @MainActor [delivery = delivery!] in try await delivery.send(event) }
                 if name == "drag-cancellation" || name == "drag-close" {
                     try await Task.sleep(for:.seconds(audit.checkInterval))
                     if name == "drag-cancellation" { sender.cancel() }
@@ -431,6 +433,7 @@ struct AuditInterference:LocalizedError {
         guard let completed = try state()["completedActions"] as? UInt64 else { throw ManagerError("No completed action counter") }
         guard let control = try state()["controlWindow"] as? UInt32 else { throw ManagerError("No control window") }
         try await click(control)
+        try await wait("manager menu presentation") { try state()["menuPresented"] as? Bool == true }
         if title.hasPrefix("Hide ") && !title.hasSuffix(" now") || title.hasPrefix("Keep ") {
             let manage = try await row(pid:managerPID,title:"Manage icons")
             try Accessibility.check(AXUIElementPerformAction(manage,kAXPressAction as CFString),"Open Manage icons")
@@ -598,7 +601,7 @@ struct AuditInterference:LocalizedError {
 
         try await select("Show \(name)")
         try await key(CGKeyCode(configuration.hotKeyCode),flags:[.maskControl,.maskAlternate])
-        try await wait("keyboard shortcut opened the manager") { try state()["managerMenuOpen"] as? Bool == true }
+        try await wait("keyboard shortcut opened the manager") { try state()["menuPresented"] as? Bool == true }
         try await Task.sleep(for:.seconds(audit.interactionHold))
         try require(try state()["phase"] as? String == "visible","Icon hid while the manager menu was open")
         let hideNow = try await row(pid:managerPID,title:"Hide \(name) now")

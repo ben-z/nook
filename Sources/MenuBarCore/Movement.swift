@@ -71,7 +71,6 @@ public enum Placement { case left, right }
         }.reduce(CGRect.null) { $0.union($1) }
         try require(!desktop.isNull,"No connected displays are available")
         let start = CGPoint(x:desktop.maxX+original.width,y:desktop.maxY+original.height)
-        let end = CGPoint(x:placement == .left ? target.minX:target.maxX,y:target.midY)
         func event(_ type:CGEventType,_ point:CGPoint,_ window:CGWindowID) throws -> CGEvent {
             guard let event = CGEvent(mouseEventSource:source,mouseType:type,mouseCursorPosition:point,mouseButton:.left) else { throw ManagerError("Cannot allocate mouse event") }
             event.flags = type == .leftMouseUp ? []:.maskCommand
@@ -98,17 +97,21 @@ public enum Placement { case left, right }
                 precondition(restored == .success && shown == .success,"Cannot restore the pointer after movement")
             }
             do {
-                try await delivery.send(down,repetitions:1)
+                try await delivery.send(down)
                 let responseDeadline = Date().addingTimeInterval(configuration.dragTimeout)
                 while try WindowMetadata.current(item).bounds.origin == original.origin {
                     try require(Date() < responseDeadline,"The status item did not acknowledge the drag start")
                     try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
                 }
+                let destination = try WindowMetadata.current(anchor).bounds
+                // Inserting a source from the left shifts the anchor by the source width.
+                let shift = original.maxX <= target.minX ? original.width:0
+                let end = CGPoint(x:(placement == .left ? destination.minX:destination.maxX)-shift,y:destination.midY)
                 if CommandLine.arguments.contains("--trace-movement") {
-                    fputs("Drag \(item): initial \(original), target \(target), down \(start), lifted \(try WindowMetadata.current(item).bounds), updated target \(try WindowMetadata.current(anchor).bounds), up \(end), renderer \(rendererPID)\n",stderr)
+                    fputs("Drag \(item): initial \(original), target \(target), down \(start), lifted \(try WindowMetadata.current(item).bounds), updated target \(destination), up \(end), renderer \(rendererPID)\n",stderr)
                 }
                 let up = try event(.leftMouseUp,end,anchor)
-                try await delivery.send(up,repetitions:2)
+                try await delivery.send(up)
             } catch {
                 for _ in 0..<2 { release.post(tap:.cgSessionEventTap); release.postToPid(rendererPID) }
                 throw error

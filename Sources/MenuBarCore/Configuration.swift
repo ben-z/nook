@@ -4,7 +4,7 @@ public struct Configuration: Sendable {
     public var gracePeriod: TimeInterval = 0.5
     public var accessibilityTimeout: Float = 0.3
     public var applicationLaunchTimeout: TimeInterval = 10
-    public var movementTimeout: TimeInterval = 1
+    public var movementTimeout: TimeInterval = 2
     public var movementCheckInterval: TimeInterval = 0.02
     public var layoutSettlementPeriod:TimeInterval = 0.12
     public var inputQuietPeriod:TimeInterval = 0.1

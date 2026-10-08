@@ -48,11 +48,18 @@ import CoreGraphics
         } catch { releasePorts(); throw error }
     }
 
-    private func check(_ type:CGEventType,channel:Int) {
-        if (type == .tapDisabledByTimeout || type == .tapDisabledByUserInput) && !(channel == 1 && sessionDisabled) {
+    private func check(_ type:CGEventType,channel:Int) -> Bool {
+        guard type == .tapDisabledByTimeout || type == .tapDisabledByUserInput else { return false }
+        // A queued disable notification can arrive after the tap is enabled again.
+        let enabled = CGEvent.tapIsEnabled(tap:ports[channel])
+        if CommandLine.arguments.contains("--trace-movement") {
+            fputs("Drag channel notification: channel \(channel), type \(type.rawValue), enabled \(enabled), intentional \(sessionDisabled)\n",stderr)
+        }
+        if !enabled && !(channel == 1 && sessionDisabled) {
             let message = "The native drag event channel was disabled (\(channel), \(type.rawValue))"
             failure = message; finish(.failure(ManagerError(message)))
         }
+        return true
     }
     private func finish(_ result:Result<Void,Error>) {
         timeout?.invalidate(); timeout = nil
@@ -73,7 +80,7 @@ import CoreGraphics
         return event
     }
     private func application(_ type:CGEventType,_ event:CGEvent) -> Bool {
-        check(type,channel:0)
+        if check(type,channel:0) { return true }
         let marker = event.getIntegerValueField(.eventSourceUserData)
         if type == .null, marker == entry?.getIntegerValueField(.eventSourceUserData), let payload {
             payload.post(tap:.cgSessionEventTap); return false
@@ -81,42 +88,40 @@ import CoreGraphics
         return true
     }
     private func session(_ type:CGEventType,_ event:CGEvent) {
-        check(type,channel:1)
+        if check(type,channel:1) { return }
         if !sessionDisabled, matches(event), let payload {
             sessionDisabled = true; CGEvent.tapEnable(tap:ports[1],enable:false)
             payload.postToPid(pid)
             finish(.success(()))
         }
     }
-    public func send(_ event:CGEvent,repetitions:Int) async throws {
-        try require(payload == nil && repetitions > 0 && ports.count == 2,"Invalid drag delivery transaction")
-        for _ in 0..<repetitions {
-            try Task.checkCancellation()
-            if let failure { throw ManagerError(failure) }
-            let entry = try Self.signalEvent()
-            self.entry = entry
-            let token = entry.getIntegerValueField(.eventSourceUserData)
-            payload = event
-            sessionDisabled = false
-            CGEvent.tapEnable(tap:ports[1],enable:true)
-            defer { timeout?.invalidate(); timeout = nil; payload = nil; self.entry = nil }
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    self.continuation = continuation
-                    let timer = Timer(timeInterval:configuration.dragTimeout,repeats:false) { [weak self] _ in
-                        MainActor.assumeIsolated {
-                            guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
-                            self.finish(.failure(ManagerError("macOS did not receive the request to move the icon")))
-                        }
+    public func send(_ event:CGEvent) async throws {
+        try require(payload == nil && ports.count == 2,"Invalid drag delivery transaction")
+        try Task.checkCancellation()
+        if let failure { throw ManagerError(failure) }
+        let entry = try Self.signalEvent()
+        self.entry = entry
+        let token = entry.getIntegerValueField(.eventSourceUserData)
+        payload = event
+        sessionDisabled = false
+        CGEvent.tapEnable(tap:ports[1],enable:true)
+        defer { timeout?.invalidate(); timeout = nil; payload = nil; self.entry = nil }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                let timer = Timer(timeInterval:configuration.dragTimeout,repeats:false) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
+                        self.finish(.failure(ManagerError("macOS did not receive the request to move the icon")))
                     }
-                    timeout = timer; RunLoop.main.add(timer,forMode:.common)
-                    entry.postToPid(pid)
                 }
-            } onCancel: {
-                Task { @MainActor [weak self] in
-                    guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
-                    self.finish(.failure(CancellationError()))
-                }
+                timeout = timer; RunLoop.main.add(timer,forMode:.common)
+                entry.postToPid(pid)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.entry?.getIntegerValueField(.eventSourceUserData) == token else { return }
+                self.finish(.failure(CancellationError()))
             }
         }
     }
