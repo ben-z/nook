@@ -118,11 +118,8 @@ public enum Placement { case left, right }
                 throw error
             }
         }
-        let deadline = Date().addingTimeInterval(configuration.movementTimeout)
-        while Date() < deadline {
-            if try position() == .adjacent { return }
-            try await Task.sleep(for:.seconds(configuration.movementCheckInterval))
-        }
+        _ = try await WindowMetadata.settledStatusWindows(configuration)
+        if try position() == .adjacent { return }
         throw ManagerError("macOS did not move the icon to the requested position: source \(try WindowMetadata.current(item).bounds), target \(try WindowMetadata.current(anchor).bounds)")
     }
 }
