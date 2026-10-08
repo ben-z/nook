@@ -440,6 +440,10 @@ struct AuditInterference:LocalizedError {
         }
         let element = try await row(pid:managerPID,title:title)
         try Accessibility.check(AXUIElementPerformAction(element,kAXPressAction as CFString),"Select \(title)")
+        if title == "Quit Nook" {
+            try await wait("manager quit") { NSRunningApplication(processIdentifier:managerPID)?.isTerminated != false }
+            return
+        }
         try await wait("menu selection completed") { try state()["completedActions"] as! UInt64 > completed && state()["busy"] as? Bool == false && state()["managerMenuOpen"] as? Bool == false }
     }
 

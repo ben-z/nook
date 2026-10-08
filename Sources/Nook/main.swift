@@ -7,6 +7,7 @@ import MenuBarCore
 @MainActor final class Manager: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let configuration = Configuration()
     let menu = NSMenu(title:"Nook")
+    let manageMenu = NSMenu(title:"Manage icons")
     lazy var movement = Movement(configuration:configuration)
     var control: NSStatusItem!
     var divider: NSStatusItem!
@@ -156,7 +157,7 @@ import MenuBarCore
             }
             menu.addItem(.separator())
             let manage = add("Manage icons",to:menu,enabled:reveal.state.phase == .hidden)
-            let settings = NSMenu(title:"Manage icons"); settings.autoenablesItems = false
+            let settings = manageMenu; settings.removeAllItems(); settings.autoenablesItems = false
             manage.submenu = settings
             for isHidden in [true,false] {
                 let group = items.filter { hidden.contains($0.key) == isHidden }
